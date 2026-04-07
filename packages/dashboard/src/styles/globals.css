@@ -79,6 +79,42 @@
   --text-2xs--line-height: 1rem;
 }
 
+/* Light theme overrides — applied when html[data-theme="light"]. The
+ * semantic tokens (success/danger/warning/primary) keep the same hue family
+ * but get darker shades for AA contrast on a near-white background.
+ */
+html[data-theme='light'] {
+  --color-bg-base: #f8fafc;
+  --color-bg-surface: #ffffff;
+  --color-bg-elevated: #ffffff;
+  --color-bg-muted: #f1f5f9;
+
+  --color-border-subtle: #e2e8f0;
+  --color-border-default: #cbd5e1;
+  --color-border-strong: #94a3b8;
+
+  --color-text-primary: #0f172a;
+  --color-text-secondary: #334155;
+  --color-text-muted: #64748b;
+  --color-text-disabled: #94a3b8;
+
+  /* Semantic — use darker shades to keep ≥4.5:1 contrast on white */
+  --color-success: #15803d;
+  --color-success-strong: #166534;
+  --color-success-soft: #dcfce7;
+  --color-danger: #b91c1c;
+  --color-danger-strong: #991b1b;
+  --color-danger-soft: #fee2e2;
+  --color-warning: #b45309;
+  --color-warning-strong: #92400e;
+  --color-warning-soft: #fef3c7;
+  --color-info: #0369a1;
+
+  --color-primary: #0284c7;
+  --color-primary-strong: #0369a1;
+  --color-primary-soft: #e0f2fe;
+}
+
 /* Base body styles */
 html,
 body,

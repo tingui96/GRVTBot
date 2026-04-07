@@ -1,7 +1,7 @@
 // Overview page — multi-bot dashboard with stat-strip + BotCard grid + create CTA.
 
 import { useQuery } from '@tanstack/react-query';
-import { useState } from 'react';
+import { lazy, Suspense, useState } from 'react';
 import { Plus } from 'lucide-react';
 import { api } from '@/lib/api-client';
 import { useWsChannel } from '@/lib/use-ws-channel';
@@ -11,8 +11,15 @@ import { Delta } from '@/components/primitives/delta';
 import { Button } from '@/components/primitives/button';
 import { Card } from '@/components/primitives/card';
 import { BotCard } from '@/components/bot-card';
-import { CreateBotWizard } from '@/components/create-bot-wizard';
 import type { BotSummary } from '@/lib/api-types';
+
+// Lazy: only loaded when the user clicks "New bot" — keeps the wizard's
+// validation hooks + Modal off the initial page payload.
+const CreateBotWizard = lazy(() =>
+  import('@/components/create-bot-wizard').then((m) => ({
+    default: m.CreateBotWizard,
+  }))
+);
 
 interface BotTick {
   id: number;
@@ -172,10 +179,14 @@ export function OverviewPage() {
         </div>
       </div>
 
-      <CreateBotWizard
-        open={wizardOpen}
-        onClose={() => setWizardOpen(false)}
-      />
+      {wizardOpen && (
+        <Suspense fallback={null}>
+          <CreateBotWizard
+            open={wizardOpen}
+            onClose={() => setWizardOpen(false)}
+          />
+        </Suspense>
+      )}
     </div>
   );
 }

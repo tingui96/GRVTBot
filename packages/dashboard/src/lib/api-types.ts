@@ -79,6 +79,29 @@ export interface Roundtrip {
   created_at: string;
 }
 
+export interface OrderRow {
+  id: number;
+  order_id: string;
+  side: 'buy' | 'sell';
+  type: 'limit' | 'market';
+  quantity: number;
+  price: number;
+  status: 'pending' | 'filled' | 'cancelled' | 'rejected';
+  grid_level_id: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FundingRow {
+  id: number;
+  instrument: string;
+  funding_rate: number;
+  payment_usdt: number;
+  position_size: number;
+  funding_time: string;
+  created_at: string;
+}
+
 export interface ValidateBotInput {
   pair: string;
   direction: 'long' | 'short';

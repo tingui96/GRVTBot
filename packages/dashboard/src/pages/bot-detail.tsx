@@ -7,8 +7,10 @@ import { useParams } from 'react-router-dom';
 import { api } from '@/lib/api-client';
 import type {
   DailySnapshot,
+  FundingRow,
   GridLevel,
   GridState,
+  OrderRow,
   Trade,
 } from '@/lib/api-types';
 import { useWsChannel } from '@/lib/use-ws-channel';
@@ -276,13 +278,27 @@ export function BotDetailPage() {
 
 // ── Tabs (Fills + Snapshots for B.5; Orders/Funding deferred) ─────────
 
+type DetailTab = 'fills' | 'orders' | 'funding' | 'snapshots';
+
 function BotDetailTabs({ botId }: { botId: number }) {
-  const [tab, setTab] = useState<'fills' | 'snapshots'>('fills');
+  const [tab, setTab] = useState<DetailTab>('fills');
 
   const tradesQuery = useQuery({
     queryKey: ['trades', botId],
     queryFn: () => api.getTrades(botId, { limit: 200 }),
     refetchInterval: 10_000,
+  });
+
+  const ordersQuery = useQuery({
+    queryKey: ['orders', botId],
+    queryFn: () => api.getOrders(botId, { status: 'all', limit: 200 }),
+    refetchInterval: 15_000,
+  });
+
+  const fundingQuery = useQuery({
+    queryKey: ['funding', botId],
+    queryFn: () => api.getFunding(botId, { limit: 500 }),
+    staleTime: 60_000,
   });
 
   const snapshotsQuery = useQuery({
@@ -302,16 +318,41 @@ function BotDetailTabs({ botId }: { botId: number }) {
               badge: tradesQuery.data?.trades.length ?? '—',
             },
             {
+              value: 'orders',
+              label: 'Orders',
+              badge: ordersQuery.data?.orders.length ?? '—',
+            },
+            {
+              value: 'funding',
+              label: 'Funding',
+              badge: fundingQuery.data?.count ?? '—',
+            },
+            {
               value: 'snapshots',
               label: 'Snapshots',
               badge: snapshotsQuery.data?.snapshots.length ?? '—',
             },
           ]}
           value={tab}
-          onChange={(v) => setTab(v as 'fills' | 'snapshots')}
+          onChange={(v) => setTab(v as DetailTab)}
         >
           {tab === 'fills' && (
             <FillsTable trades={tradesQuery.data?.trades ?? []} loading={tradesQuery.isPending} />
+          )}
+          {tab === 'orders' && (
+            <OrdersTable
+              orders={ordersQuery.data?.orders ?? []}
+              degraded={ordersQuery.data?.degraded}
+              hint={ordersQuery.data?.hint}
+              loading={ordersQuery.isPending}
+            />
+          )}
+          {tab === 'funding' && (
+            <FundingTable
+              funding={fundingQuery.data?.funding ?? []}
+              total={fundingQuery.data?.totalPaymentUsdt ?? 0}
+              loading={fundingQuery.isPending}
+            />
           )}
           {tab === 'snapshots' && (
             <SnapshotsTable
@@ -504,6 +545,218 @@ function SnapshotsTable({
       rowKey={(r) => r.id}
       emptyMessage="No snapshots yet"
     />
+  );
+}
+
+// ── Orders ────────────────────────────────────────────────────────────
+
+const ORDER_STATUS_TONE: Record<OrderRow['status'], string> = {
+  pending: 'text-warning',
+  filled: 'text-success',
+  cancelled: 'text-text-muted',
+  rejected: 'text-danger',
+};
+
+const ORDERS_COLUMNS: Column<OrderRow>[] = [
+  {
+    key: 'time',
+    header: 'Updated',
+    render: (r) => formatTimeUtc(new Date(r.updated_at).getTime()),
+    sortValue: (r) => new Date(r.updated_at).getTime(),
+    mono: true,
+    width: '160px',
+  },
+  {
+    key: 'side',
+    header: 'Side',
+    render: (r) => (
+      <span
+        className={
+          r.side === 'buy'
+            ? 'text-success font-semibold uppercase'
+            : 'text-danger font-semibold uppercase'
+        }
+      >
+        {r.side}
+      </span>
+    ),
+    align: 'center',
+    width: '70px',
+  },
+  {
+    key: 'type',
+    header: 'Type',
+    render: (r) => (
+      <span className="uppercase text-2xs tracking-wider">{r.type}</span>
+    ),
+    align: 'center',
+    width: '70px',
+  },
+  {
+    key: 'price',
+    header: 'Price',
+    render: (r) => formatUsd(r.price),
+    sortValue: (r) => r.price,
+    align: 'right',
+    mono: true,
+  },
+  {
+    key: 'qty',
+    header: 'Size',
+    render: (r) => formatSize(r.quantity),
+    sortValue: (r) => r.quantity,
+    align: 'right',
+    mono: true,
+  },
+  {
+    key: 'status',
+    header: 'Status',
+    render: (r) => (
+      <span className={`${ORDER_STATUS_TONE[r.status]} uppercase tracking-wider text-2xs font-semibold`}>
+        {r.status}
+      </span>
+    ),
+    align: 'center',
+  },
+  {
+    key: 'order_id',
+    header: 'Order ID',
+    render: (r) => <span className="text-text-muted text-2xs">{r.order_id.slice(0, 12)}…</span>,
+    align: 'left',
+  },
+];
+
+function OrdersTable({
+  orders,
+  loading,
+  degraded,
+  hint,
+}: {
+  orders: OrderRow[];
+  loading: boolean;
+  degraded?: boolean;
+  hint?: string;
+}) {
+  if (loading) {
+    return (
+      <div className="text-center py-8 text-sm text-text-muted animate-pulse">
+        Loading orders…
+      </div>
+    );
+  }
+  if (degraded) {
+    return (
+      <div className="text-center py-8 text-sm text-warning">
+        Orders table degraded
+        {hint && <div className="text-2xs text-text-muted mt-1">{hint}</div>}
+      </div>
+    );
+  }
+  return (
+    <DataTable
+      rows={orders}
+      columns={ORDERS_COLUMNS}
+      pageSize={20}
+      rowKey={(r) => r.id}
+      emptyMessage="No orders in local DB yet"
+    />
+  );
+}
+
+// ── Funding ───────────────────────────────────────────────────────────
+
+const FUNDING_COLUMNS: Column<FundingRow>[] = [
+  {
+    key: 'time',
+    header: 'Time (UTC)',
+    render: (r) => {
+      const ms = new Date(r.funding_time).getTime();
+      return formatTimeUtc(ms);
+    },
+    sortValue: (r) => new Date(r.funding_time).getTime(),
+    mono: true,
+    width: '160px',
+  },
+  {
+    key: 'rate',
+    header: 'Rate',
+    render: (r) => `${(r.funding_rate * 100).toFixed(4)}%`,
+    sortValue: (r) => r.funding_rate,
+    align: 'right',
+    mono: true,
+  },
+  {
+    key: 'pos',
+    header: 'Position',
+    render: (r) => formatSize(r.position_size),
+    sortValue: (r) => r.position_size,
+    align: 'right',
+    mono: true,
+  },
+  {
+    key: 'payment',
+    header: 'Payment',
+    render: (r) => (
+      <span
+        className={
+          r.payment_usdt > 0
+            ? 'text-success'
+            : r.payment_usdt < 0
+              ? 'text-danger'
+              : ''
+        }
+      >
+        {formatPnl(r.payment_usdt)}
+      </span>
+    ),
+    sortValue: (r) => r.payment_usdt,
+    align: 'right',
+    mono: true,
+  },
+];
+
+function FundingTable({
+  funding,
+  total,
+  loading,
+}: {
+  funding: FundingRow[];
+  total: number;
+  loading: boolean;
+}) {
+  if (loading) {
+    return (
+      <div className="text-center py-8 text-sm text-text-muted animate-pulse">
+        Loading funding…
+      </div>
+    );
+  }
+  return (
+    <div>
+      <div className="flex items-center justify-end pb-3 px-3 text-xs">
+        <span className="text-text-muted uppercase tracking-wider mr-2">
+          Total
+        </span>
+        <span
+          className={
+            total > 0
+              ? 'text-success'
+              : total < 0
+                ? 'text-danger'
+                : 'text-text-primary'
+          }
+        >
+          <Mono>{formatPnl(total)}</Mono>
+        </span>
+      </div>
+      <DataTable
+        rows={funding}
+        columns={FUNDING_COLUMNS}
+        pageSize={20}
+        rowKey={(r) => r.id}
+        emptyMessage="No funding events recorded"
+      />
+    </div>
   );
 }
 

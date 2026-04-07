@@ -22,6 +22,7 @@ const NAV: NavItem[] = [
 export function BottomNav() {
   return (
     <nav
+      aria-label="Mobile navigation"
       className={cn(
         'md:hidden flex',
         'fixed bottom-0 inset-x-0 h-14 z-40',

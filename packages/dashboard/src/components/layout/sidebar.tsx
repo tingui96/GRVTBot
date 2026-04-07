@@ -28,7 +28,7 @@ export function Sidebar() {
         'pt-4 pb-4'
       )}
     >
-      <nav className="flex-1 px-2 flex flex-col gap-1">
+      <nav aria-label="Main navigation" className="flex-1 px-2 flex flex-col gap-1">
         {NAV.map((item) => (
           <NavLink
             key={item.to}

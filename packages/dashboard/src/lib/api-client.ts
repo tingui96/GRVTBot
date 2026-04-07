@@ -12,8 +12,10 @@ import {
   type Candle,
   type CandleInterval,
   type DailySnapshot,
+  type FundingRow,
   type GridState,
   type HealthV2,
+  type OrderRow,
   type Roundtrip,
   type Trade,
   type ValidateBotInput,
@@ -84,6 +86,30 @@ export const api = {
     request<{ roundtrips: Roundtrip[]; count: number; totalProfit: number }>(
       `/bots/${id}/roundtrips`
     ),
+
+  getOrders: (
+    id: number,
+    opts: { status?: 'all' | 'pending' | 'filled' | 'cancelled' | 'rejected'; limit?: number } = {}
+  ) => {
+    const qs = new URLSearchParams();
+    if (opts.status) qs.set('status', opts.status);
+    if (opts.limit) qs.set('limit', String(opts.limit));
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return request<{ orders: OrderRow[]; degraded?: boolean; hint?: string }>(
+      `/bots/${id}/orders${suffix}`
+    );
+  },
+
+  getFunding: (id: number, opts: { limit?: number } = {}) => {
+    const qs = new URLSearchParams();
+    if (opts.limit) qs.set('limit', String(opts.limit));
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return request<{
+      funding: FundingRow[];
+      count: number;
+      totalPaymentUsdt: number;
+    }>(`/bots/${id}/funding${suffix}`);
+  },
 
   validateBot: (input: ValidateBotInput) =>
     request<ValidateBotResult>('/bots/validate', {

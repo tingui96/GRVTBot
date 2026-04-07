@@ -1,7 +1,9 @@
-import { Activity } from 'lucide-react';
+import { Activity, Moon, Sun } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { useWsStatus } from '@/lib/use-ws-channel';
 import type { WsStatus } from '@/lib/ws-client';
+import { applyThemeToDocument, useUiStore } from '@/stores/ui-store';
+import { useEffect } from 'react';
 
 const STATUS_STYLES: Record<WsStatus, { color: string; label: string }> = {
   open: { color: 'text-success', label: 'Live' },
@@ -13,6 +15,13 @@ const STATUS_STYLES: Record<WsStatus, { color: string; label: string }> = {
 export function Header() {
   const status = useWsStatus();
   const styles = STATUS_STYLES[status];
+  const theme = useUiStore((s) => s.theme);
+  const toggleTheme = useUiStore((s) => s.toggleTheme);
+
+  // Re-apply on every theme change so the document attribute stays in sync.
+  useEffect(() => {
+    applyThemeToDocument(theme);
+  }, [theme]);
 
   return (
     <header
@@ -37,15 +46,31 @@ export function Header() {
           styles.color
         )}
         title={`WebSocket: ${status}`}
+        role="status"
+        aria-live="polite"
       >
         <span
           className={cn(
             'inline-block size-2 rounded-full bg-current',
             status === 'open' && 'pulse-slow'
           )}
+          aria-hidden="true"
         />
         {styles.label}
       </div>
+
+      <button
+        type="button"
+        onClick={toggleTheme}
+        aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+        className="ml-2 size-8 rounded-md flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-bg-muted transition-colors"
+      >
+        {theme === 'dark' ? (
+          <Sun className="size-4" aria-hidden="true" />
+        ) : (
+          <Moon className="size-4" aria-hidden="true" />
+        )}
+      </button>
     </header>
   );
 }

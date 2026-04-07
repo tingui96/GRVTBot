@@ -56,13 +56,19 @@ export function Modal({
       onClose={onClose}
       onClick={handleBackdropClick}
       className={cn(
-        'p-0 m-auto rounded-lg overflow-hidden',
+        'p-0 overflow-hidden',
         'bg-bg-elevated text-text-primary border border-border-default shadow-lg',
         'backdrop:bg-black/70',
         'open:flex open:flex-col',
-        SIZE_CLASS[size],
-        'w-full max-h-[85vh]'
+        // Mobile: full-width bottom sheet docked at the bottom of the viewport.
+        // Desktop: centered modal with size cap.
+        'w-full max-h-[92dvh] md:max-h-[85dvh]',
+        'rounded-t-lg md:rounded-lg',
+        'fixed bottom-0 left-0 right-0 m-0 md:static md:m-auto',
+        SIZE_CLASS[size]
       )}
+      aria-modal="true"
+      role="dialog"
     >
       <header className="flex items-start justify-between px-6 py-4 border-b border-border-subtle">
         <div>

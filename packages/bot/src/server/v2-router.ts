@@ -261,6 +261,69 @@ export function createV2Router(deps: V2RouterDeps): Router {
     return;
   }));
 
+  // ── GET /api/v2/bots/:id/orders ───────────────────────────────────
+  // Local DB orders (the GRVT live open orders are surfaced via grid-state).
+  // The orders table can be SQLITE_CORRUPT on legacy databases — we wrap
+  // the query and degrade gracefully so the dashboard still loads.
+  router.get('/bots/:id/orders', asyncHandler(async (req, res) => {
+    const id = parseInt(String(req.params.id ?? ''), 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    const status = String(req.query.status ?? 'all');
+    const limit = Math.min(parseInt(String(req.query.limit ?? '200'), 10) || 200, 1000);
+
+    try {
+      const where = status === 'all' ? '' : 'AND status = ?';
+      const params: unknown[] = [id];
+      if (status !== 'all') params.push(status);
+      params.push(limit);
+      const orders = await dbAll(db, `
+        SELECT id, order_id, side, type, quantity, price, status,
+               grid_level_id, created_at, updated_at
+        FROM orders
+        WHERE bot_id = ? ${where}
+        ORDER BY id DESC
+        LIMIT ?
+      `, params);
+      res.json({ orders });
+      return;
+    } catch (err) {
+      // SQLITE_CORRUPT or schema mismatch on legacy DBs — return empty
+      // instead of 500 so the tab can render an empty state.
+      log.warn({ err: (err as Error).message }, 'orders query failed');
+      res.json({ orders: [], degraded: true, hint: (err as Error).message });
+      return;
+    }
+  }));
+
+  // ── GET /api/v2/bots/:id/funding ──────────────────────────────────
+  router.get('/bots/:id/funding', asyncHandler(async (req, res) => {
+    const id = parseInt(String(req.params.id ?? ''), 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    const limit = Math.min(parseInt(String(req.query.limit ?? '500'), 10) || 500, 5000);
+
+    const funding = await dbAll(db, `
+      SELECT id, instrument, funding_rate, payment_usdt, position_size,
+             funding_time, created_at
+      FROM funding_history
+      WHERE bot_id = ?
+      ORDER BY funding_time DESC
+      LIMIT ?
+    `, [id, limit]);
+
+    const totals = await dbGet<{ count: number; total: number }>(db, `
+      SELECT COUNT(*) as count, COALESCE(SUM(payment_usdt), 0) as total
+      FROM funding_history
+      WHERE bot_id = ?
+    `, [id]);
+
+    res.json({
+      funding,
+      count: totals?.count ?? 0,
+      totalPaymentUsdt: totals?.total ?? 0,
+    });
+    return;
+  }));
+
   // ── POST /api/v2/bots/validate ────────────────────────────────────
   // DRY-RUN endpoint for the Create Bot Wizard. Validates the proposed
   // config and returns the computed grid parameters (spacing, qty/level,
