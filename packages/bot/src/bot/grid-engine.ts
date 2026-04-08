@@ -246,15 +246,47 @@ export class GridEngine extends EventEmitter {
         return;
       }
 
-      // Detect existing GRVT-side state. Either signal triggers RESUME mode.
-      const existingOrders = await grvtClient.getOpenOrders(bot.pair).catch((err) => {
-        console.warn(`⚠️ getOpenOrders failed during startBot detection: ${err.message}`);
-        return [];
-      });
-      const existingPosition = await grvtClient.getPosition(bot.pair).catch((err) => {
-        console.warn(`⚠️ getPosition failed during startBot detection: ${err.message}`);
-        return null;
-      });
+      // ── DETECT EXISTING GRVT-SIDE STATE (FAIL LOUD) ──────────────
+      // We MUST verify the live GRVT state before deciding RESUME vs
+      // FRESH START. The previous version caught errors and returned
+      // []/null, which silently routed us through FRESH START even
+      // when the bot had a real open position — `placeInitialOrders`
+      // would then DOUBLE the position and trip the GRVT 100-order
+      // Tier 1 cap with a "Insufficient margin" error.
+      //
+      // New rule: if EITHER of the two read calls fails (after a
+      // single retry), refuse to start. Operator must investigate
+      // the GRVT API issue before proceeding. Failing closed is
+      // strictly safer than guessing wrong.
+      const fetchWithRetry = async <T>(
+        label: string,
+        fn: () => Promise<T>
+      ): Promise<T> => {
+        try {
+          return await fn();
+        } catch (err1) {
+          console.warn(`⚠️ ${label} failed once during startBot detection, retrying in 1s: ${(err1 as Error).message}`);
+          await new Promise((r) => setTimeout(r, 1000));
+          try {
+            return await fn();
+          } catch (err2) {
+            throw new Error(
+              `Cannot verify GRVT state for bot ${botId} (${label}): ${(err2 as Error).message}. ` +
+              `Refusing to start to avoid doubling an existing position. ` +
+              `Investigate the GRVT API and try again.`
+            );
+          }
+        }
+      };
+
+      const existingOrders = await fetchWithRetry(
+        'getOpenOrders',
+        () => grvtClient.getOpenOrders(bot.pair)
+      );
+      const existingPosition = await fetchWithRetry(
+        'getPosition',
+        () => grvtClient.getPosition(bot.pair)
+      );
       const positionSize =
         existingPosition && (existingPosition as any).size
           ? Math.abs(parseFloat((existingPosition as any).size))
@@ -1118,39 +1150,60 @@ export class GridEngine extends EventEmitter {
   private async pollFillArchive(): Promise<void> {
     if (this.bots.size === 0) return;
 
-    let allFills: any[];
-    try {
-      allFills = await grvtClient.getFillHistory(1000);
-    } catch (err) {
-      console.warn(`⚠️ Fill poller: getFillHistory failed: ${(err as Error).message}`);
-      return;
-    }
-    if (!Array.isArray(allFills) || allFills.length === 0) return;
-
-    let newFillCount = 0;
-    let newFeeSum = 0;
-    for (const f of allFills) {
-      const eventTime = String(f.event_time ?? '');
-      if (!eventTime) continue;
-      const fee = parseFloat(f.fee ?? '0');
-      const inserted = await db.insertFillArchive({
-        fill_id: eventTime,
-        event_time: eventTime,
-        is_buyer: f.is_buyer ? 1 : 0,
-        price: parseFloat(f.price ?? '0'),
-        size: parseFloat(f.size ?? '0'),
-        fee,
-        created_at: new Date(Number(eventTime) / 1_000_000).toISOString(),
-      });
-      if (inserted) {
-        newFillCount++;
-        newFeeSum += fee;
+    // Build instrument → bot lookup so each fill can be attributed.
+    // v0 constraint: one running bot per instrument per sub-account.
+    // If two running bots share an instrument the lookup picks the
+    // first; that case is unsupported for now and would need order_id
+    // tracking to disambiguate.
+    const instrumentToBot = new Map<string, { id: number; pair: string }>();
+    for (const [botId, instance] of this.bots) {
+      const pair = instance.getPair();
+      if (pair && !instrumentToBot.has(pair)) {
+        instrumentToBot.set(pair, { id: botId, pair });
       }
     }
 
-    if (newFillCount > 0) {
+    // Fetch one batch per distinct instrument so we don't miss fills
+    // for non-default pairs. For a single bot this is one call.
+    const counts = new Map<string, { added: number; feeSum: number }>();
+    for (const [instrument, botRef] of instrumentToBot) {
+      let allFills: any[];
+      try {
+        allFills = await grvtClient.getFillHistory(1000, instrument);
+      } catch (err) {
+        console.warn(`⚠️ Fill poller [${instrument}]: getFillHistory failed: ${(err as Error).message}`);
+        continue;
+      }
+      if (!Array.isArray(allFills) || allFills.length === 0) continue;
+
+      let added = 0;
+      let feeSum = 0;
+      for (const f of allFills) {
+        const eventTime = String(f.event_time ?? '');
+        if (!eventTime) continue;
+        const fee = parseFloat(f.fee ?? '0');
+        const inserted = await db.insertFillArchive({
+          fill_id: eventTime,
+          event_time: eventTime,
+          is_buyer: f.is_buyer ? 1 : 0,
+          price: parseFloat(f.price ?? '0'),
+          size: parseFloat(f.size ?? '0'),
+          fee,
+          created_at: new Date(Number(eventTime) / 1_000_000).toISOString(),
+          bot_id: botRef.id,
+          instrument,
+        });
+        if (inserted) {
+          added++;
+          feeSum += fee;
+        }
+      }
+      if (added > 0) counts.set(instrument, { added, feeSum });
+    }
+
+    for (const [instrument, c] of counts) {
       console.log(
-        `📥 Fill archive: +${newFillCount} new fills (real fee sum ${newFeeSum.toFixed(6)} USDT, ${newFeeSum < 0 ? 'rebate earned' : 'fees paid'})`
+        `📥 Fill archive [${instrument}]: +${c.added} new (fee sum ${c.feeSum.toFixed(6)} USDT, ${c.feeSum < 0 ? 'rebate earned' : 'fees paid'})`
       );
     }
   }
@@ -1167,6 +1220,17 @@ class GridBotInstance {
 
   constructor(bot: GridBot) {
     this.bot = bot;
+  }
+
+  /** Read-only accessor used by the engine's fill poller to attribute
+   *  fills to the right (bot, instrument) pair without breaking
+   *  encapsulation. */
+  getPair(): string {
+    return this.bot.pair;
+  }
+
+  getBotId(): number {
+    return this.bot.id;
   }
 
   async loadGridLevels(): Promise<void> {

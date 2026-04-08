@@ -327,9 +327,10 @@ export function createV2Router(deps: V2RouterDeps): Router {
     }>(db, `
       SELECT id, fill_id, event_time, is_buyer, price, size, fee, created_at
       FROM fills_archive
+      WHERE bot_id = ?
       ORDER BY event_time DESC
       LIMIT ?
-    `, [limit]);
+    `, [id, limit]);
 
     res.json({ fills });
     return;
@@ -348,7 +349,6 @@ export function createV2Router(deps: V2RouterDeps): Router {
   router.get('/bots/:id/rebate-summary', asyncHandler(async (req, res) => {
     const id = parseInt(String(req.params.id ?? ''), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
-    void id; // fills_archive is global in v0; ignored until multi-bot migration
 
     const row = await dbGet<{
       count: number;
@@ -361,7 +361,8 @@ export function createV2Router(deps: V2RouterDeps): Router {
              MIN(fee) AS min_fee,
              MAX(fee) AS max_fee
       FROM fills_archive
-    `);
+      WHERE bot_id = ?
+    `, [id]);
 
     const sumFee = row?.sum_fee ?? 0;
     const count = row?.count ?? 0;
@@ -455,9 +456,9 @@ export function createV2Router(deps: V2RouterDeps): Router {
     }>(db, `
       SELECT is_buyer, price, size, fee, event_time
       FROM fills_archive
-      WHERE event_time >= ?
+      WHERE bot_id = ? AND event_time >= ?
       ORDER BY event_time ASC
-    `, [createdAtNs]);
+    `, [id, createdAtNs]);
 
     if (fills.length === 0) {
       res.json({
@@ -530,24 +531,34 @@ export function createV2Router(deps: V2RouterDeps): Router {
     return;
   }));
 
-  // ── POST /api/v2/admin/backfill-fills ─────────────────────────────
-  // One-shot backfill: pages getFillHistory backwards using end_time
-  // until either GRVT returns nothing, the script hits maxBatches, or
-  // it observes a stall (same oldest fill twice in a row, which means
-  // GRVT is ignoring end_time and we'd loop forever).
+  // ── POST /api/v2/admin/backfill-fills?botId=N ─────────────────────
+  // One-shot backfill for a specific bot. Pages getFillHistory backwards
+  // using end_time until either GRVT returns nothing, the loop hits
+  // maxBatches, or it observes a stall (same oldest fill twice in a row,
+  // which means GRVT is ignoring end_time and we'd loop forever).
   //
-  // Idempotent — every fill goes through INSERT OR IGNORE on
-  // (event_time) so re-running is safe and a no-op once everything
-  // is already in fills_archive.
+  // Multi-bot: requires botId so each row can be attributed correctly.
+  // Looks up the bot's pair from grid_bots and uses that as the GRVT
+  // instrument filter. Idempotent via INSERT OR IGNORE on event_time.
   //
   // Returns counts for the operator to verify how much new data was
   // recovered. Triggered manually via curl with X-Api-Key.
   router.post('/admin/backfill-fills', asyncHandler(async (req, res) => {
+    const botId = parseInt(String(req.query.botId ?? '0'), 10);
+    if (!Number.isFinite(botId) || botId <= 0) {
+      return res.status(400).json({ error: 'botId query param required' });
+    }
+
+    const bot = await dbGet<{ id: number; pair: string }>(db, `
+      SELECT id, pair FROM grid_bots WHERE id = ?
+    `, [botId]);
+    if (!bot) return res.status(404).json({ error: 'bot not found' });
+
     const maxBatches = Math.min(
       parseInt(String(req.query.maxBatches ?? '20'), 10) || 20,
       50
     );
-    const instrument = String(req.query.instrument ?? 'ETH_USDT_Perp');
+    const instrument = bot.pair;
     const t0 = Date.now();
 
     let totalFetched = 0;
@@ -565,8 +576,6 @@ export function createV2Router(deps: V2RouterDeps): Router {
       const oldest = batch[batch.length - 1];
       if (!oldest) break;
 
-      // Stall detection: if GRVT silently ignores end_time, we'll see
-      // the same oldest event_time twice in a row.
       if (lastOldest !== null && lastOldest === String(oldest.event_time)) {
         stalled = true;
         break;
@@ -579,8 +588,8 @@ export function createV2Router(deps: V2RouterDeps): Router {
         totalFetched++;
         const result = await dbRun(db, `
           INSERT OR IGNORE INTO fills_archive
-            (fill_id, event_time, is_buyer, price, size, fee, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
+            (fill_id, event_time, is_buyer, price, size, fee, created_at, bot_id, instrument)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `, [
           eventTime,
           eventTime,
@@ -589,6 +598,8 @@ export function createV2Router(deps: V2RouterDeps): Router {
           parseFloat(f.size ?? '0'),
           parseFloat(f.fee ?? '0'),
           new Date(Number(eventTime) / 1_000_000).toISOString(),
+          botId,
+          instrument,
         ]);
         if ((result?.changes ?? 0) > 0) totalInserted++;
       }
@@ -614,9 +625,11 @@ export function createV2Router(deps: V2RouterDeps): Router {
              MIN(fee) AS min_fee,
              MAX(fee) AS max_fee
       FROM fills_archive
-    `);
+      WHERE bot_id = ?
+    `, [botId]);
     res.json({
       ok: true,
+      botId,
       instrument,
       batches,
       maxBatches,

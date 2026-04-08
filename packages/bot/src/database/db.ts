@@ -335,9 +335,13 @@ export class GridBotDB {
       )
     `);
 
-    // Tabla: fills_archive - cache de fills procesados (sin bot_id, global)
-    // Originally created ad-hoc by an emergency script. Now part of the schema
-    // so fresh installs and migrations work correctly.
+    // Tabla: fills_archive — every GRVT fill we've ever observed for this
+    // sub-account, attributed to a bot via (bot_id, instrument).
+    // Originally created ad-hoc by an emergency script (no bot_id, global).
+    // Migration below adds bot_id + instrument so multi-bot setups can
+    // attribute correctly. Constraint: each instrument can only have
+    // ONE running bot at a time per sub-account in v0 — fills are
+    // attributed by instrument lookup against grid_bots.
     await this.dbRun(`
       CREATE TABLE IF NOT EXISTS fills_archive (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -347,8 +351,42 @@ export class GridBotDB {
         price REAL,
         size REAL,
         fee REAL,
-        created_at TEXT
+        created_at TEXT,
+        bot_id INTEGER REFERENCES grid_bots(id) ON DELETE SET NULL,
+        instrument TEXT
       )
+    `);
+
+    // Migration: add bot_id + instrument to legacy installs.
+    try {
+      await this.dbRun(`ALTER TABLE fills_archive ADD COLUMN bot_id INTEGER REFERENCES grid_bots(id) ON DELETE SET NULL`);
+      console.log('✅ Columna bot_id agregada a fills_archive');
+    } catch (e) { /* already exists */ }
+    try {
+      await this.dbRun(`ALTER TABLE fills_archive ADD COLUMN instrument TEXT`);
+      console.log('✅ Columna instrument agregada a fills_archive');
+    } catch (e) { /* already exists */ }
+
+    // Backfill rows with NULL bot_id by attributing to the only bot whose
+    // pair MIGHT have generated them. This is a best-effort migration:
+    // if there's exactly ONE bot in the table, all NULL rows go to it.
+    // If there are multiple bots already, leave NULLs alone (the operator
+    // must manually attribute or accept that legacy fills are unattributed).
+    await this.dbRun(`
+      UPDATE fills_archive
+      SET bot_id = (SELECT id FROM grid_bots LIMIT 1),
+          instrument = (SELECT pair FROM grid_bots LIMIT 1)
+      WHERE bot_id IS NULL
+        AND (SELECT COUNT(*) FROM grid_bots) = 1
+    `);
+
+    await this.dbRun(`
+      CREATE INDEX IF NOT EXISTS idx_fills_archive_bot
+        ON fills_archive(bot_id, event_time)
+    `);
+    await this.dbRun(`
+      CREATE INDEX IF NOT EXISTS idx_fills_archive_instrument
+        ON fills_archive(instrument, event_time)
     `);
 
     // Tabla: paired_roundtrips - round-trips emparejados (buy + sell)
@@ -839,8 +877,9 @@ export class GridBotDB {
    * is safe and returns 0 changes the second time. Returns true if a new
    * row was inserted, false if it was a duplicate.
    *
-   * The fills_archive table has no bot_id (global) — fine for v0 with a
-   * single bot, will need a migration once multi-bot is live.
+   * Multi-bot: caller MUST provide bot_id and instrument so the row can
+   * be filtered correctly. v0 attribution is by instrument lookup
+   * (one running bot per instrument per sub-account).
    */
   async insertFillArchive(params: {
     fill_id: string;
@@ -850,11 +889,13 @@ export class GridBotDB {
     size: number;
     fee: number;
     created_at: string;
+    bot_id: number | null;
+    instrument: string | null;
   }): Promise<boolean> {
     const result = await this.dbRun(`
       INSERT OR IGNORE INTO fills_archive
-        (fill_id, event_time, is_buyer, price, size, fee, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+        (fill_id, event_time, is_buyer, price, size, fee, created_at, bot_id, instrument)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [
       params.fill_id,
       params.event_time,
@@ -863,6 +904,8 @@ export class GridBotDB {
       params.size,
       params.fee,
       params.created_at,
+      params.bot_id,
+      params.instrument,
     ]);
     return (result.changes ?? 0) > 0;
   }
