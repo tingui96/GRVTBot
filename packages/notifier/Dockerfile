@@ -35,7 +35,6 @@ WORKDIR /app
 
 COPY --from=builder --chown=notifier:notifier /build/packages/notifier/dist ./dist
 COPY --from=builder --chown=notifier:notifier /build/node_modules ./node_modules
-COPY --from=builder --chown=notifier:notifier /build/packages/notifier/node_modules ./packages-node_modules
 COPY --chown=notifier:notifier packages/notifier/package.json ./package.json
 
 # Cursor state directory — separate from the bot's data dir

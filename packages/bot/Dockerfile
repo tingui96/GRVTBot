@@ -1,15 +1,15 @@
 # Multi-stage build for the GRVT Grid bot.
 #
-# Stage 1: build the bot TypeScript + compile better-sqlite3 / sqlite3 native
-# bindings against a glibc base. We need build-essential + python because
-# sqlite3 still ships some platforms without prebuilt binaries.
-#
-# Stage 2: slim runtime image. Copies dist + node_modules from stage 1, drops
-# everything else. Runs as non-root grvtbot user with a fixed UID so the
-# bind-mounted data dir on the host has predictable ownership.
+# Stage 1 (bot-builder): build the bot TypeScript + compile sqlite3 native
+# bindings against a glibc base.
+# Stage 2 (dashboard-builder): build the React SPA into static assets.
+# Stage 3 (runtime): slim runtime image. Copies the bot dist + node_modules
+# from stage 1 and the dashboard dist from stage 2, drops everything else.
+# Runs as non-root grvtbot (fixed UID 10000) for predictable bind-mount
+# ownership on the host.
 
-# ── Stage 1: builder ──────────────────────────────────────────────────────
-FROM node:22-bookworm-slim AS builder
+# ── Stage 1: bot builder ──────────────────────────────────────────────────
+FROM node:22-bookworm-slim AS bot-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -32,7 +32,31 @@ COPY packages/bot/src packages/bot/src
 COPY packages/bot/tests packages/bot/tests
 RUN npm run build --workspace=@grvt-grid/bot
 
-# ── Stage 2: runtime ──────────────────────────────────────────────────────
+# ── Stage 2: dashboard builder ────────────────────────────────────────────
+# Builds the SPA into /build/packages/dashboard/dist. The dashboard uses
+# Vite which bakes VITE_* env vars into the bundle at build time, so we
+# expose them as ARGs that the host can pass via --build-arg.
+FROM node:22-bookworm-slim AS dashboard-builder
+
+WORKDIR /build
+
+ARG VITE_BASE_PATH=/dashboard/
+ARG VITE_API_BASE_URL=
+ARG VITE_DASHBOARD_API_KEY=
+
+ENV VITE_BASE_PATH=${VITE_BASE_PATH} \
+    VITE_API_BASE_URL=${VITE_API_BASE_URL} \
+    VITE_DASHBOARD_API_KEY=${VITE_DASHBOARD_API_KEY}
+
+COPY package.json package-lock.json ./
+COPY packages/dashboard/package.json packages/dashboard/
+
+RUN npm ci --workspace=@grvt-grid/dashboard --include-workspace-root
+
+COPY packages/dashboard packages/dashboard
+RUN npm run build --workspace=@grvt-grid/dashboard
+
+# ── Stage 3: runtime ──────────────────────────────────────────────────────
 FROM node:22-bookworm-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -47,15 +71,17 @@ RUN groupadd -g 10000 grvtbot && \
 
 WORKDIR /app
 
-# Copy compiled output + production node_modules from builder
-COPY --from=builder --chown=grvtbot:grvtbot /build/packages/bot/dist ./dist
-COPY --from=builder --chown=grvtbot:grvtbot /build/node_modules ./node_modules
-COPY --from=builder --chown=grvtbot:grvtbot /build/packages/bot/node_modules ./packages-node_modules
+# Copy compiled output + production node_modules from bot-builder.
+# npm workspaces hoists everything to the root node_modules (no nested
+# packages/bot/node_modules), so a single copy is enough.
+COPY --from=bot-builder --chown=grvtbot:grvtbot /build/packages/bot/dist ./dist
+COPY --from=bot-builder --chown=grvtbot:grvtbot /build/node_modules ./node_modules
 COPY --chown=grvtbot:grvtbot packages/bot/package.json ./package.json
 
-# The dashboard SPA bundle. The host can mount /app/dashboard-dist to
-# override with a freshly-built version, or use the baked-in default.
-COPY --chown=grvtbot:grvtbot packages/dashboard/dist ./dashboard-dist
+# The dashboard SPA bundle, freshly built in stage 2. The host can override
+# with a bind mount to /app/dashboard-dist if needed (e.g. to test a UI
+# build without rebuilding the whole image).
+COPY --from=dashboard-builder --chown=grvtbot:grvtbot /build/packages/dashboard/dist ./dashboard-dist
 
 # Data dir is a bind-mount target for the SQLite db + WAL files
 RUN mkdir -p /app/data && chown grvtbot:grvtbot /app/data
