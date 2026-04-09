@@ -116,6 +116,13 @@ export function UpdateRangeDialog({
 
   const plan: RangeUpdatePlan | null = previewQuery.data?.plan ?? null;
 
+  // Snapshot the order count BEFORE the mutation starts so the
+  // progress UI can detect the cancel→place transition. We capture
+  // it from the plan (ordersToCancel) which the preview already
+  // computed. Total target = plan.levelsToCreate.
+  const ordersAtStart = plan?.ordersToCancel ?? 0;
+  const totalTarget = plan?.levelsToCreate ?? 0;
+
   const mutation = useMutation({
     mutationFn: () =>
       api.updateBotRange(bot.id, { lowerPrice: lowerNum, upperPrice: upperNum }),
@@ -130,6 +137,53 @@ export function UpdateRangeDialog({
     },
     onError: (err: Error) => toast.error(`Range update failed: ${err.message}`),
   });
+
+  // Poll grid-state every 1s while the mutation is in flight so we
+  // can show real progress instead of a 90-second "Updating…". The
+  // server-side flow is:
+  //   1. Cancel all current orders     (ordersAtStart → 0)
+  //   2. Optional market-buy ETH       (no order count change)
+  //   3. Place new orders              (0 → totalTarget)
+  // We use openOrders.length to detect which phase we're in and
+  // compute a single 0-100 progress.
+  const progressQuery = useQuery({
+    queryKey: ['range-update-progress', bot.id],
+    queryFn: () => api.getGridState(bot.id),
+    enabled: mutation.isPending,
+    refetchInterval: 1000,
+    refetchIntervalInBackground: true,
+  });
+
+  // Phase + progress computation. The cancel phase counts down from
+  // ordersAtStart to 0, then the place phase counts up from 0 to
+  // totalTarget. We split the bar 50/50 between the two phases so
+  // 100% maps to "all new orders placed".
+  const liveOrderCount = progressQuery.data?.openOrders.length ?? ordersAtStart;
+  let progressPct = 0;
+  let phaseText = 'Starting…';
+  if (mutation.isPending && totalTarget > 0) {
+    if (liveOrderCount > 0 && liveOrderCount >= ordersAtStart * 0.95) {
+      // Still in cancel phase (orders > 95% of original)
+      phaseText = `Cancelling old orders (${liveOrderCount}/${ordersAtStart})…`;
+      progressPct = 5;
+    } else if (liveOrderCount > totalTarget * 0.5 && liveOrderCount < ordersAtStart) {
+      // Cancel mostly done, mid-transition
+      phaseText = 'Cancelling old orders…';
+      progressPct = 25;
+    } else if (liveOrderCount === 0 || liveOrderCount < totalTarget * 0.1) {
+      // Cancel done, place not yet started or just started
+      phaseText = plan?.autoBuy
+        ? `Buying ${plan.autoBuy.size.toFixed(2)} ETH…`
+        : 'Placing new orders…';
+      progressPct = 50;
+    } else {
+      // Place phase: counting up to totalTarget
+      const placed = liveOrderCount;
+      const placePct = Math.min(100, (placed / totalTarget) * 100);
+      phaseText = `Placing new orders (${placed}/${totalTarget})…`;
+      progressPct = 50 + placePct * 0.5;
+    }
+  }
 
   // Submit gating: form valid + plan loaded + zero violations + not pending.
   // Note: a no-op is technically allowed (server short-circuits) but we
@@ -251,6 +305,34 @@ export function UpdateRangeDialog({
             disabled={mutation.isPending}
           />
         </div>
+
+        {/* Progress overlay while the commit is in flight. The preview
+            stays visible underneath but the user gets real feedback
+            on which phase the engine is in (cancel → optional buy →
+            place) and a 0-100 bar driven by polling /grid-state. */}
+        {mutation.isPending && (
+          <div className="rounded-md border border-primary/40 bg-primary-soft/30 p-3 space-y-2">
+            <div className="flex items-center justify-between text-xs">
+              <div className="flex items-center gap-2 text-text-primary font-semibold">
+                <Loader2 className="size-4 animate-spin text-primary" />
+                {phaseText}
+              </div>
+              <Mono className="text-text-secondary">
+                {Math.round(progressPct)}%
+              </Mono>
+            </div>
+            <div className="h-1.5 rounded-full bg-bg-elevated overflow-hidden">
+              <div
+                className="h-full bg-primary transition-[width] duration-500 ease-out"
+                style={{ width: `${progressPct}%` }}
+              />
+            </div>
+            <p className="text-2xs text-text-muted">
+              This usually takes 60-90 seconds. The monitor loop is
+              paused for this bot during the mutation.
+            </p>
+          </div>
+        )}
 
         {/* Live preview area — switches between loading / error / plan / empty */}
         <PreviewArea
