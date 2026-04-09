@@ -1,7 +1,7 @@
 // Grid Trading Engine - Fase 3
 // Lógica completa de grid trading con safeguards para dinero real
 
-import { grvtClient } from '../api/client.js';
+import { grvtClient, type GRVTClient } from '../api/client.js';
 import { db } from '../database/db.js';
 import type { GridBot, GridLevel, OrderRecord } from '../database/db.js';
 import { EventEmitter } from 'events';
@@ -1506,9 +1506,26 @@ class GridBotInstance {
   private gridLevels: GridLevel[] = [];
   private activeOrders = new Map<string, OrderRecord>();
   private processedFills = new Set<string>(); // ⚠️ NUEVO: Deduplicación de fills
+  // Multi-tenant: per-user GRVT client. If null, falls back to the
+  // module-level `grvtClient` singleton (legacy single-tenant path).
+  // This lets bot 44 (owner) keep running on the singleton while new
+  // bots created by other users get their own client via the factory.
+  private injectedClient: GRVTClient | null = null;
 
-  constructor(bot: GridBot) {
+  constructor(bot: GridBot, client?: GRVTClient) {
     this.bot = bot;
+    this.injectedClient = client ?? null;
+  }
+
+  /** Accessor for the GRVT client this bot should use. Falls back
+   *  to the legacy singleton if no per-user client was injected. */
+  private get grvt(): GRVTClient {
+    return this.injectedClient ?? grvtClient;
+  }
+
+  /** Replace the injected client (e.g. when user updates creds). */
+  rebindClient(client: GRVTClient): void {
+    this.injectedClient = client;
   }
 
   /** Read-only accessor used by the engine's fill poller to attribute
@@ -1590,7 +1607,7 @@ class GridBotInstance {
     console.log(`🔍 [DEBUG] Bot ${this.bot.id}: Cargados ${this.gridLevels.length} niveles de grid`);
     
     // Obtener precio actual
-    const ticker = await grvtClient.getTicker(this.bot.pair);
+    const ticker = await this.grvt.getTicker(this.bot.pair);
     const currentPrice = parseFloat(ticker.last_price);
 
     console.log(`📊 Bot ${this.bot.id}: Precio actual ${this.bot.pair}: $${currentPrice}`);
@@ -1694,11 +1711,11 @@ class GridBotInstance {
       console.log(`💰 [REAL] Bot ${this.bot.id}: Ejecutando compra inicial MARKET...`);
 
       // Usar precio ligeramente arriba del ask para asegurar fill
-      const ticker = await grvtClient.getTicker(this.bot.pair);
+      const ticker = await this.grvt.getTicker(this.bot.pair);
       const askPrice = parseFloat((ticker as any).best_ask_price || (ticker as any).best_ask || ticker.last_price);
       const safeBuyPrice = Math.floor(askPrice * 1.001 * 100) / 100; // 0.1% arriba del ask, rounded to tick
 
-      const order = await grvtClient.createOrder({
+      const order = await this.grvt.createOrder({
         sub_account_id: process.env.GRVT_TRADING_ACCOUNT_ID!,
         instrument: this.bot.pair,
         size: (Math.floor(totalQuantityNeeded * 100) / 100).toString(), // Round to 0.01
@@ -1715,7 +1732,7 @@ class GridBotInstance {
       await new Promise(resolve => setTimeout(resolve, 2000));
 
       // Verificar si se ejecutó
-      const fills = await grvtClient.getFillHistory(10, this.bot.pair!);
+      const fills = await this.grvt.getFillHistory(10, this.bot.pair!);
       const initialFills = fills.filter(fill => 
         fill.order_id === order.order_id && fill.side === 'buy'
       );
@@ -1865,7 +1882,7 @@ class GridBotInstance {
       // 💰 MODO REAL: Colocar orden en GRVT usando nuevo formato
       console.log(`💰 [DEBUG] REAL MODE - Enviando orden a GRVT con nuevo createOrder...`);
       
-      const order = await grvtClient.createOrder({
+      const order = await this.grvt.createOrder({
         sub_account_id: process.env.GRVT_TRADING_ACCOUNT_ID!,
         instrument: this.bot.pair,
         size: level.quantity.toString(),
@@ -1886,7 +1903,7 @@ class GridBotInstance {
         await new Promise(r => setTimeout(r, 1000));
         
         // Buscar la orden por precio en open_orders
-        const openOrders = await grvtClient.getOpenOrders(this.bot.pair);
+        const openOrders = await this.grvt.getOpenOrders(this.bot.pair);
         const match = openOrders.find((o: any) => {
           const orderPrice = o.legs?.[0]?.limit_price ? parseFloat(o.legs[0].limit_price) : 0;
           return Math.abs(orderPrice - level.price) < 1.0;
@@ -1960,10 +1977,10 @@ class GridBotInstance {
     if (freshBot) this.bot = freshBot;
     
     // 1. Get open orders from GRVT
-    const openOrders = await grvtClient.getOpenOrders(this.bot.pair);
+    const openOrders = await this.grvt.getOpenOrders(this.bot.pair);
     
     // 2. Get current price from the last ticker
-    const ticker = await grvtClient.getTicker(this.bot.pair);
+    const ticker = await this.grvt.getTicker(this.bot.pair);
     const currentPrice = parseFloat(ticker.last_price);
     
     // 3. Build set of GRVT prices (rounded) for coverage check
@@ -2028,7 +2045,7 @@ class GridBotInstance {
     
     if (uncoveredLevels.length > 1 && openOrders.length < 94) {
       // Check fill_history ONCE for recent fills (last 90s)
-      const recentFills = await grvtClient.getFillHistory(50, this.bot.pair!);
+      const recentFills = await this.grvt.getFillHistory(50, this.bot.pair!);
       const now = Date.now();
       
       for (let i = 1; i < uncoveredLevels.length; i++) {
@@ -2086,7 +2103,7 @@ class GridBotInstance {
         if (ords.length > 1) {
           for (let i = 1; i < ords.length; i++) {
             try {
-              await grvtClient.cancelOrder(ords[i].order_id, this.bot.pair);
+              await this.grvt.cancelOrder(ords[i].order_id, this.bot.pair);
               console.log(`🗑️ Killed dupe @ $${price}`);
             } catch (e) { /* ignore */ }
           }
@@ -2179,7 +2196,7 @@ class GridBotInstance {
       let realFills: any[] = [];
       let totalFees = 0;
       try {
-        const fillHistory = await grvtClient.getFillHistory(50, this.bot.pair);
+        const fillHistory = await this.grvt.getFillHistory(50, this.bot.pair);
         // Buscar fills que corresponden a esta orden (por client_order_id o timestamp cercano)
         const orderTrackingId = order.metadata || orderId;
         realFills = fillHistory.filter(fill => {
@@ -2277,7 +2294,7 @@ class GridBotInstance {
             
             try {
               // Verificar cuántas órdenes abiertas tenemos
-              const openOrders = await grvtClient.getOpenOrders();
+              const openOrders = await this.grvt.getOpenOrders();
               const orderCount = openOrders.length;
               
               console.log(`📊 Órdenes abiertas: ${orderCount}/100`);
@@ -2396,7 +2413,7 @@ class GridBotInstance {
       }
 
       // Obtener precio actual
-      const ticker = await grvtClient.getTicker(this.bot.pair);
+      const ticker = await this.grvt.getTicker(this.bot.pair);
       const currentPrice = parseFloat(ticker.last_price);
 
       console.log(`🔍 Revisando ${pendingLevels.length} niveles pendientes (precio actual: $${currentPrice})`);
@@ -2448,7 +2465,7 @@ class GridBotInstance {
   private async updatePnL(): Promise<void> {
     try {
       // Obtener posición actual
-      const position = await grvtClient.getPosition(this.bot.pair);
+      const position = await this.grvt.getPosition(this.bot.pair);
       
       let trendPnl = 0;
       let positionSize = 0;
@@ -2495,7 +2512,7 @@ class GridBotInstance {
    * its own fills (filtered by bot_id from fills_archive).
    *
    * Bot 44 hit a leak on 2026-04-08: the previous implementation
-   * called grvtClient.getFillHistory(1000) which returns the entire
+   * called this.grvt.getFillHistory(1000) which returns the entire
    * sub-account history with NO bot attribution, then ran spread-pair
    * over the lot. Result: bot 44 (running 6 minutes, 5 fills) inherited
    * bot 42's full $76 of grid profit. The fills_archive table has
@@ -2599,7 +2616,7 @@ class GridBotInstance {
    * Cancelar todas las órdenes activas
    */
   async cancelAllOrders(): Promise<void> {
-    const cancelledCount = await grvtClient.cancelAllOrders(this.bot.pair);
+    const cancelledCount = await this.grvt.cancelAllOrders(this.bot.pair);
     this.activeOrders.clear();
     
     console.log(`❌ ${cancelledCount} órdenes canceladas para bot ${this.bot.id}`);
@@ -2643,7 +2660,7 @@ class GridBotInstance {
       // Obtener precio actual de ETH
       let ethPrice: number | null = null;
       try {
-        const tickers = await grvtClient.getTickers(['ETH_USDT_Perp']);
+        const tickers = await this.grvt.getTickers(['ETH_USDT_Perp']);
         if (tickers && tickers.length > 0 && tickers[0]?.last_price) {
           ethPrice = parseFloat(tickers[0].last_price);
         }
@@ -2664,7 +2681,7 @@ class GridBotInstance {
           }
           
           // Obtener balance actual
-          const balance = await grvtClient.getBalance();
+          const balance = await this.grvt.getBalance();
           const equity = parseFloat(balance.total_equity || '0');
           
           // Calcular grid profit net

@@ -2,7 +2,14 @@
 // Wrapper completo para todas las llamadas a GRVT
 // Métodos: balance, positions, orders, fills, funding, leverage, etc.
 
-import { authenticatedRequest, publicRequest } from './auth.js';
+import {
+  authenticatedRequest,
+  publicRequest,
+  authenticateGRVT,
+  authenticateWithKey,
+  authenticatedRequestWithState,
+  createEmptyAuthState,
+} from './auth.js';
 import { signOrder, formatSignedOrderForAPI } from './order-signer.js';
 import dotenv from 'dotenv';
 
@@ -155,23 +162,83 @@ class RateLimiter {
 const rateLimiter = new RateLimiter();
 
 /**
- * GRVT API Client Class
+ * Explicit GRVT credentials passed to the constructor for multi-tenant
+ * mode. When omitted, the client falls back to env vars (legacy path).
+ */
+export interface GrvtClientCreds {
+  apiKey: string;
+  apiSecret: string;        // private key for EIP-712 signing
+  tradingAddress: string;    // wallet address matching the private key
+  accountId: string;         // GRVT account id
+  subAccountId: string;      // GRVT sub-account id
+}
+
+/**
+ * GRVT API Client Class.
+ *
+ * Multi-tenant: if `creds` are passed to the constructor, the client
+ * uses those explicitly (per-user mode). If omitted, falls back to
+ * env vars (legacy singleton mode). Each instance has its own auth
+ * state so cookie sessions don't leak between users.
  */
 export class GRVTClient {
   private tradingAccountId: string;
+  // Per-instance credentials. null → use env (legacy path).
+  private creds: GrvtClientCreds | null;
+  // Per-instance auth state so each user's cookie session is isolated.
+  private instanceAuthState: import('./auth.js').AuthState;
 
-  constructor() {
-    // MOCK_MODE / DRY_RUN: allow the bot to boot without real GRVT
-    // credentials so self-hosters can take a tour of the dashboard before
-    // they have an account, and so the docker image can be smoke-tested in
-    // CI without secrets. The engine layer (grid-engine.ts) already checks
-    // MOCK_MODE to short-circuit any path that would actually call GRVT,
-    // so the dummy account id never reaches the wire.
-    const isMockMode = process.env.MOCK_MODE === 'true' || process.env.DRY_RUN === 'true';
-    this.tradingAccountId = process.env.GRVT_TRADING_ACCOUNT_ID || (isMockMode ? 'mock-account' : '');
-    if (!this.tradingAccountId) {
-      throw new Error('GRVT_TRADING_ACCOUNT_ID no encontrado en .env (set MOCK_MODE=true to bypass for development)');
+  constructor(creds?: GrvtClientCreds) {
+    this.instanceAuthState = createEmptyAuthState();
+    this.creds = creds ?? null;
+
+    if (creds) {
+      this.tradingAccountId = creds.subAccountId;
+    } else {
+      // Legacy fallback: read from env.
+      const isMockMode = process.env.MOCK_MODE === 'true' || process.env.DRY_RUN === 'true';
+      this.tradingAccountId = process.env.GRVT_TRADING_ACCOUNT_ID || (isMockMode ? 'mock-account' : '');
+      if (!this.tradingAccountId) {
+        throw new Error('GRVT_TRADING_ACCOUNT_ID no encontrado en .env (set MOCK_MODE=true to bypass for development)');
+      }
     }
+  }
+
+  /** Login to GRVT using this client's API key. Only needed when
+   *  using explicit creds — the legacy path re-auths inside
+   *  authenticatedRequest(). */
+  async login(): Promise<boolean> {
+    if (this.creds) {
+      return authenticateWithKey(this.creds.apiKey, this.instanceAuthState);
+    }
+    return authenticateGRVT();
+  }
+
+  /** Make an authenticated request using per-instance or global auth. */
+  private async authedRequest(url: string, body: object = {}, options?: { method?: string; timeout?: number }): Promise<any> {
+    if (this.creds) {
+      return authenticatedRequestWithState(this.instanceAuthState, this.creds.apiKey, url, body, options);
+    }
+    return authenticatedRequest(url, body, options);
+  }
+
+  /** Get the signing credentials for this client (for order-signer). */
+  getSigningCreds(): { privateKey: string; signerAddress: string; subAccountId: string } {
+    if (this.creds) {
+      return {
+        privateKey: this.creds.apiSecret,
+        signerAddress: this.creds.tradingAddress,
+        subAccountId: this.creds.subAccountId,
+      };
+    }
+    // Legacy: from env
+    const privateKey = process.env.GRVT_API_SECRET;
+    const signerAddress = process.env.GRVT_TRADING_ADDRESS;
+    const subAccountId = process.env.GRVT_TRADING_ACCOUNT_ID;
+    if (!privateKey || !signerAddress || !subAccountId) {
+      throw new Error('Credenciales faltantes: GRVT_API_SECRET, GRVT_TRADING_ADDRESS, GRVT_TRADING_ACCOUNT_ID');
+    }
+    return { privateKey, signerAddress, subAccountId };
   }
 
   // === MARKET DATA (público) ===
@@ -254,7 +321,7 @@ export class GRVTClient {
   async getBalance(): Promise<Balance> {
     await rateLimiter.waitIfNeeded();
     
-    const data = await authenticatedRequest(`${TRADING_URL}/account_summary`, {
+    const data = await this.authedRequest(`${TRADING_URL}/account_summary`, {
       sub_account_id: this.tradingAccountId
     });
     
@@ -275,7 +342,7 @@ export class GRVTClient {
   async getPositions(): Promise<Position[]> {
     await rateLimiter.waitIfNeeded();
     
-    const data = await authenticatedRequest(`${TRADING_URL}/positions`, { sub_account_id: this.tradingAccountId });
+    const data = await this.authedRequest(`${TRADING_URL}/positions`, { sub_account_id: this.tradingAccountId });
     return Array.isArray(data) ? data : [];
   }
 
@@ -298,7 +365,7 @@ export class GRVTClient {
       body.instrument = instrument;
     }
     
-    const data = await authenticatedRequest(`${TRADING_URL}/open_orders`, body);
+    const data = await this.authedRequest(`${TRADING_URL}/open_orders`, body);
     return Array.isArray(data) ? data : [];
   }
 
@@ -320,13 +387,19 @@ export class GRVTClient {
     console.log(`📝 Creando orden: ${request.side} ${request.size} ${request.instrument} @ ${request.price}`);
     
     try {
-      // Firmar orden con EIP-712
+      // Firmar orden con EIP-712 — pass per-instance signing creds
+      // so multi-tenant clients each sign with their own private key.
+      const sc = this.getSigningCreds();
       const signedOrder = await signOrder({
         instrument: request.instrument,
         side: request.side,
         size: request.size,
         price: request.price!,
         postOnly: request.post_only || false,
+      }, {
+        privateKey: sc.privateKey,
+        signerAddress: sc.signerAddress,
+        subAccountId: sc.subAccountId,
       });
 
       // Formatear para API de GRVT
@@ -341,7 +414,7 @@ export class GRVTClient {
       console.log('🔏 Orden firmada, enviando a GRVT...');
       
       // ⚠️ CAMBIO: endpoint /full/v1/create_order
-      const data = await authenticatedRequest(`${TRADING_URL}/create_order`, orderData);
+      const data = await this.authedRequest(`${TRADING_URL}/create_order`, orderData);
       
       console.log('✅ Respuesta GRVT createOrder:', data);
       
@@ -379,7 +452,7 @@ export class GRVTClient {
     console.log(`❌ Cancelando orden: ${orderId}`);
     
     try {
-      await authenticatedRequest(`${TRADING_URL}/cancel_order`, {
+      await this.authedRequest(`${TRADING_URL}/cancel_order`, {
         sub_account_id: this.tradingAccountId,
         order_id: orderId,
         instrument: instrument
@@ -408,7 +481,7 @@ export class GRVTClient {
     }
 
     try {
-      const data = await authenticatedRequest(`${TRADING_URL}/cancel_all_orders`, body);
+      const data = await this.authedRequest(`${TRADING_URL}/cancel_all_orders`, body);
       const cancelledCount = data.cancelled_count || 0;
       console.log(`✅ ${cancelledCount} órdenes canceladas`);
       return cancelledCount;
@@ -427,7 +500,7 @@ export class GRVTClient {
     console.log(`⚡ Estableciendo leverage ${leverage}x para ${instrument}`);
     
     try {
-      await authenticatedRequest(`${TRADING_URL}/set_leverage`, {
+      await this.authedRequest(`${TRADING_URL}/set_leverage`, {
         sub_account_id: this.tradingAccountId,
         instrument: instrument,
         leverage: leverage.toString()
@@ -484,7 +557,7 @@ export class GRVTClient {
       body.end_time = endTimeNs;
     }
 
-    const data = await authenticatedRequest(`${TRADING_URL}/fill_history`, body);
+    const data = await this.authedRequest(`${TRADING_URL}/fill_history`, body);
     return Array.isArray(data) ? data : [];
   }
 
@@ -509,7 +582,7 @@ export class GRVTClient {
       console.log(`📡 [DEBUG] Getting funding from account_summary (funding_history no disponible)...`);
       
       // Obtener account_summary que incluye cumulative_realized_funding_payment
-      const data = await authenticatedRequest(`${TRADING_URL}/account_summary`, {
+      const data = await this.authedRequest(`${TRADING_URL}/account_summary`, {
         sub_account_id: this.tradingAccountId
       });
       

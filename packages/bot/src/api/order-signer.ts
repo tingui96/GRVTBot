@@ -153,7 +153,21 @@ export interface SignedOrder {
 /**
  * Firmar orden usando EIP-712
  */
-export async function signOrder(params: OrderParams): Promise<SignedOrder> {
+/**
+ * Optional explicit signing credentials. When provided, signOrder
+ * uses these instead of reading from environment variables. This is
+ * the multi-tenant path: each GRVTClient passes its own creds.
+ */
+export interface SigningCreds {
+  privateKey: string;      // hex private key (0x...)
+  signerAddress: string;   // Ethereum address (0x...)
+  subAccountId: string;    // GRVT sub_account_id
+}
+
+export async function signOrder(
+  params: OrderParams,
+  signingCreds?: SigningCreds
+): Promise<SignedOrder> {
   const { instrument, side, size, price, isMarket = false, timeInForce = 1, postOnly: postOnlyParam = false } = params;
 
   // Validar que tengamos configuración para el instrumento
@@ -170,10 +184,10 @@ export async function signOrder(params: OrderParams): Promise<SignedOrder> {
     throw new Error('Precio requerido para órdenes limit');
   }
 
-  // Obtener credenciales de entorno
-  const privateKey = process.env.GRVT_API_SECRET;
-  const signerAddress = process.env.GRVT_TRADING_ADDRESS;
-  const subAccountID = process.env.GRVT_TRADING_ACCOUNT_ID;
+  // Multi-tenant: use explicit creds if provided, else fall back to env.
+  const privateKey = signingCreds?.privateKey ?? process.env.GRVT_API_SECRET;
+  const signerAddress = signingCreds?.signerAddress ?? process.env.GRVT_TRADING_ADDRESS;
+  const subAccountID = signingCreds?.subAccountId ?? process.env.GRVT_TRADING_ACCOUNT_ID;
 
   if (!privateKey || !signerAddress || !subAccountID) {
     throw new Error('Credenciales faltantes: GRVT_API_SECRET, GRVT_TRADING_ADDRESS, GRVT_TRADING_ACCOUNT_ID');
