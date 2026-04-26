@@ -136,6 +136,24 @@ export class WsDispatcher {
         payload
       );
     });
+
+    // H.2: auto-shift completed. Surfaces in the dashboard's notification
+    // bell so the user knows the grid moved without having to diff the
+    // chart manually.
+    this.engine.on('autoShifted', (payload: {
+      botId: number;
+      fromRange: { lower: number; upper: number };
+      toRange: { lower: number; upper: number };
+      currentPrice: number;
+      exitDist: number;
+    }) => {
+      log.info({ ...payload }, 'auto-shift completed');
+      wsBus.publishToMany(
+        [`bot:${payload.botId}`, 'bots', 'notifications'],
+        'autoShifted',
+        payload
+      );
+    });
   }
 
   // ─── Per-bot state tick poller ────────────────────────────────────────

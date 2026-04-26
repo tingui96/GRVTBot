@@ -569,6 +569,12 @@ export function BotDetailPage() {
         <CompoundSettings bot={bot} />
       )}
 
+      {/* H.2 — auto-shift status. Only shown when the bot was configured
+          with auto_shift_enabled at creation. Read-only view. */}
+      {bot.auto_shift_enabled === 1 && (
+        <AutoShiftStatus bot={bot} />
+      )}
+
       {/* Tabs */}
       <BotDetailTabs botId={botId} />
 
@@ -582,6 +588,38 @@ export function BotDetailPage() {
         markPrice={markPrice}
       />
     </div>
+  );
+}
+
+// ── H.2: Auto-shift status (read-only). Auto-shift is configured at
+// creation time and currently has no in-place edit UI — when triggered,
+// the engine re-centers the range on current price and writes
+// last_auto_shift_at. Cooldown is 1h between shifts.
+
+function AutoShiftStatus({ bot }: { bot: any }) {
+  const triggerPct = bot.auto_shift_pct ?? 0;
+  const lastAt = bot.last_auto_shift_at as number | null | undefined;
+  return (
+    <Card className="p-5">
+      <div className="flex items-center justify-between">
+        <div>
+          <h3 className="text-sm font-semibold text-text-primary">
+            Auto-shift
+          </h3>
+          <p className="text-2xs text-text-muted mt-0.5">
+            Re-centers the grid on current price when price exits the
+            range by more than {triggerPct}% of the range width. Max
+            once per hour.
+          </p>
+        </div>
+        <div className="text-right">
+          <div className="text-2xs text-text-muted">Last shift</div>
+          <Mono className="text-sm text-text-primary">
+            {formatTimeUtc(lastAt ?? null)}
+          </Mono>
+        </div>
+      </div>
+    </Card>
   );
 }
 

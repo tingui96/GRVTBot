@@ -64,6 +64,7 @@ export interface GridBot {
   // H.2: dynamic grid auto-shift
   auto_shift_enabled?: number;
   auto_shift_pct?: number | null;
+  last_auto_shift_at?: number | null;
   // H.4: DCA mode
   bot_type?: 'grid' | 'dca';
   dca_amount_usdt?: number | null;
@@ -361,6 +362,7 @@ export class GridBotDB {
       // H.2: dynamic grid auto-shift
       'auto_shift_enabled INTEGER DEFAULT 0',
       'auto_shift_pct REAL',
+      'last_auto_shift_at INTEGER',
       // H.4: DCA mode
       "bot_type TEXT DEFAULT 'grid'",
       'dca_amount_usdt REAL',

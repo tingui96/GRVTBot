@@ -902,20 +902,22 @@ export class GridEngine extends EventEmitter {
     }
 
     // H.2: process auto-shift requests. Rate-limited to max once per
-    // hour per bot. Reuses updateBotRange() which has full safety checks.
+    // hour per bot via last_auto_shift_at column (persisted so the
+    // limit survives restarts — otherwise a crash loop could re-shift
+    // every boot). Reuses updateBotRange() which has full safety checks.
     for (const [botId, instance] of this.bots) {
       const req = instance.autoShiftRequested;
       if (!req) continue;
       instance.autoShiftRequested = null;
 
-      // Rate limit: check last shift time stored as a tag in the instance
-      const lastShift = (instance as any)._lastAutoShiftAt ?? 0;
+      const bot = instance.getBot();
+      const lastShift = bot.last_auto_shift_at ?? 0;
       if (Date.now() - lastShift < 3600_000) continue; // max once/hour
 
-      const bot = instance.getBot();
       const rangeWidth = bot.upper_price - bot.lower_price;
       const newLower = Math.round((req.currentPrice - rangeWidth / 2) * 100) / 100;
       const newUpper = Math.round((req.currentPrice + rangeWidth / 2) * 100) / 100;
+      const fromRange = { lower: bot.lower_price, upper: bot.upper_price };
 
       log.info(
         { botId, currentPrice: req.currentPrice, exitDist: req.exitDist, newLower, newUpper },
@@ -924,7 +926,16 @@ export class GridEngine extends EventEmitter {
 
       try {
         await this.updateBotRange(botId, newLower, newUpper);
-        (instance as any)._lastAutoShiftAt = Date.now();
+        await db.updateBot(botId, { last_auto_shift_at: Date.now() });
+        const freshBot = await db.getBot(botId);
+        if (freshBot) instance.refreshBot(freshBot);
+        this.emit('autoShifted', {
+          botId,
+          fromRange,
+          toRange: { lower: newLower, upper: newUpper },
+          currentPrice: req.currentPrice,
+          exitDist: req.exitDist,
+        });
         log.info({ botId, newLower, newUpper }, 'auto-shift completed');
       } catch (shiftErr) {
         log.warn(

@@ -30,6 +30,13 @@ export interface BotSummary {
   total_reinvested?: number;
   original_investment_usdt?: number;
   quantity_per_level?: number;
+  // H.2: dynamic grid auto-shift
+  auto_shift_enabled?: 0 | 1;
+  auto_shift_pct?: number | null;
+  last_auto_shift_at?: number | null;
+  // H.8: virtual grids
+  virtual_enabled?: 0 | 1;
+  active_window_size?: number | null;
 }
 
 export interface GridLevel {
