@@ -1,15 +1,21 @@
 // Overview page — multi-bot dashboard with stat-strip + BotCard grid + create CTA.
+//
+// H.7: aggregates (equity, PnL, exposure, leverage, equity curve) come from
+// the dedicated /portfolio-summary + /portfolio-equity-curve endpoints
+// instead of being re-summed client-side. Single source of truth, and
+// includes risk metrics the client previously didn't have access to.
 
 import { useQuery } from '@tanstack/react-query';
 import { lazy, Suspense, useEffect, useState } from 'react';
 import { Plus } from 'lucide-react';
 import { api } from '@/lib/api-client';
-import { formatPercent, formatPnl, formatUsd } from '@/lib/format';
+import { formatPercent, formatPnl, formatUsd, formatUsdCompact } from '@/lib/format';
 import { StatCard } from '@/components/primitives/stat-card';
 import { Delta } from '@/components/primitives/delta';
 import { Button } from '@/components/primitives/button';
 import { Card } from '@/components/primitives/card';
 import { BotCard } from '@/components/bot-card';
+import { EquityCurve } from '@/components/charts/equity-curve';
 
 // Lazy: only loaded when the user clicks "New bot" — keeps the wizard's
 // validation hooks + Modal off the initial page payload.
@@ -23,13 +29,23 @@ export function OverviewPage() {
   const botsQuery = useQuery({
     queryKey: ['bots'],
     queryFn: () => api.getBots(),
-    // Re-fetch every 5s to pick up live changes from running bots; the
-    // per-bot WS subscription on each BotCard will paint smoother live
-    // ticks on the cards themselves, but the aggregate stat strip uses
-    // this REST data so it stays consistent across all bots without
-    // needing a multi-channel WS manager.
     refetchInterval: 5_000,
     staleTime: 2_000,
+  });
+
+  const summaryQuery = useQuery({
+    queryKey: ['portfolio-summary'],
+    queryFn: () => api.getPortfolioSummary(),
+    refetchInterval: 5_000,
+    staleTime: 2_000,
+  });
+
+  // Equity curve refreshes less often — daily_snapshots are written ~1/day.
+  const curveQuery = useQuery({
+    queryKey: ['portfolio-equity-curve'],
+    queryFn: () => api.getPortfolioEquityCurve(90),
+    refetchInterval: 60_000,
+    staleTime: 30_000,
   });
 
   const [wizardOpen, setWizardOpen] = useState(false);
@@ -64,34 +80,26 @@ export function OverviewPage() {
   const allBots = botsQuery.data?.bots ?? [];
   const bots = allBots.filter((b) => b.status !== 'stopped');
 
-  // Aggregate equity / pnl across all bots, preferring tick data when present.
-  // Aggregate, source-of-truth-aware:
-  //   - invested:    bot.investment_usdt (immutable, set at creation)
-  //   - unrealized:  bot.trend_pnl_usdt or live tick (mark-to-market on
-  //                  the open position; the bot already computes this
-  //                  from the live ticker)
-  //   - realized:    FIFO sum from fills_archive, NET of fees, via the
-  //                  /realized-summary endpoint. Fallback to legacy
-  //                  bot.grid_profit_usdt only while the query is in
-  //                  flight so the card never blanks.
-  //   - totalPnl:    realized + unrealized (rebuilt from real numbers,
-  //                  NOT from the legacy bot.total_pnl_usdt which is
-  //                  stale because it stores grid_profit + trend_pnl)
-  //   - equity:      invested + totalPnl
-  let totalInvested = 0;
-  let totalUnrealized = 0;
-  let totalRealized = 0;
-  let runningCount = 0;
-  for (const bot of bots) {
-    totalInvested += bot.investment_usdt;
-    totalUnrealized += bot.trend_pnl_usdt;
-    totalRealized += bot.grid_profit_usdt;
-    if (bot.status === 'running') runningCount++;
-  }
+  // Prefer server aggregate; fall back to a quick local sum while it loads
+  // so the strip never blanks during the first paint.
+  const summary = summaryQuery.data;
+  const fallbackInvested = bots.reduce((s, b) => s + b.investment_usdt, 0);
+  const fallbackRealized = bots.reduce((s, b) => s + b.grid_profit_usdt, 0);
+  const fallbackUnrealized = bots.reduce((s, b) => s + b.trend_pnl_usdt, 0);
+  const fallbackPnl = fallbackRealized + fallbackUnrealized;
+  const fallbackEquity = fallbackInvested + fallbackPnl;
+  const fallbackPct = fallbackInvested > 0 ? (fallbackPnl / fallbackInvested) * 100 : 0;
 
-  const totalPnl = totalRealized + totalUnrealized;
-  const totalEquity = totalInvested + totalPnl;
-  const totalPct = totalInvested > 0 ? (totalPnl / totalInvested) * 100 : 0;
+  const totalInvested = summary?.totalInvested ?? fallbackInvested;
+  const totalEquity = summary?.totalEquity ?? fallbackEquity;
+  const totalPnl = summary?.totalPnl ?? fallbackPnl;
+  const totalPnlPct = summary?.totalPnlPct ?? fallbackPct;
+  const totalRealized = summary?.totalRealized ?? fallbackRealized;
+  const totalUnrealized = summary?.totalUnrealized ?? fallbackUnrealized;
+  const totalPositionUsdt = summary?.totalPositionUsdt ?? 0;
+  const avgLeverage = summary?.avgLeverage ?? 0;
+  const pairExposure = summary?.pairExposure ?? {};
+  const runningCount = summary?.runningCount ?? bots.filter((b) => b.status === 'running').length;
 
   return (
     <div className="flex flex-col gap-6">
@@ -115,7 +123,7 @@ export function OverviewPage() {
         <StatCard
           label="Total equity"
           value={formatUsd(totalEquity)}
-          delta={<Delta value={totalPct} format={formatPercent} />}
+          delta={<Delta value={totalPnlPct} format={formatPercent} />}
         />
         <StatCard
           label="Total PnL"
@@ -152,6 +160,31 @@ export function OverviewPage() {
         />
       </div>
 
+      {/* Risk strip — H.7 */}
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-px bg-border-subtle rounded-lg overflow-hidden">
+        <StatCard label="Position notional" value={formatUsdCompact(totalPositionUsdt)} />
+        <StatCard label="Invested" value={formatUsdCompact(totalInvested)} />
+        <StatCard label="Avg leverage" value={`${avgLeverage.toFixed(1)}x`} />
+      </div>
+
+      {/* Portfolio equity + pair exposure — H.7 */}
+      {bots.length > 0 && (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <Card className="lg:col-span-2">
+            <h2 className="text-sm font-semibold text-text-secondary uppercase tracking-wider mb-3">
+              Portfolio equity (90d)
+            </h2>
+            <EquityCurve points={curveQuery.data?.points ?? []} height={220} />
+          </Card>
+          <Card>
+            <h2 className="text-sm font-semibold text-text-secondary uppercase tracking-wider mb-3">
+              Pair exposure
+            </h2>
+            <PairExposureList exposure={pairExposure} />
+          </Card>
+        </div>
+      )}
+
       {/* BotCard grid */}
       <div>
         <h2 className="text-sm font-semibold text-text-secondary uppercase tracking-wider mb-3">
@@ -187,6 +220,46 @@ export function OverviewPage() {
         </Suspense>
       )}
     </div>
+  );
+}
+
+// Horizontal bars sized to the largest exposure. Empty state when every
+// bot has a flat position (e.g. all paused with no fills yet).
+function PairExposureList({ exposure }: { exposure: Record<string, number> }) {
+  const entries = Object.entries(exposure)
+    .filter(([, v]) => v > 0)
+    .sort((a, b) => b[1] - a[1]);
+
+  if (entries.length === 0) {
+    return <p className="text-xs text-text-muted">No open positions</p>;
+  }
+
+  const total = entries.reduce((s, [, v]) => s + v, 0);
+  const max = entries[0][1];
+
+  return (
+    <ul className="flex flex-col gap-3">
+      {entries.map(([pair, notional]) => {
+        const pct = total > 0 ? (notional / total) * 100 : 0;
+        const barWidth = max > 0 ? (notional / max) * 100 : 0;
+        return (
+          <li key={pair} className="flex flex-col gap-1">
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-mono text-text-primary">{pair}</span>
+              <span className="font-mono text-text-muted">
+                {formatUsdCompact(notional)} · {pct.toFixed(0)}%
+              </span>
+            </div>
+            <div className="h-1.5 bg-bg-base rounded-full overflow-hidden">
+              <div
+                className="h-full bg-primary rounded-full transition-[width] duration-300"
+                style={{ width: `${barWidth}%` }}
+              />
+            </div>
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 

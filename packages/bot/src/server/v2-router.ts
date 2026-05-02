@@ -2157,15 +2157,18 @@ export function createV2Router(deps: V2RouterDeps): Router {
 
   // ── GET /api/v2/portfolio-summary ───────────────────────────────────
   // H.7: aggregate risk metrics across all user bots.
+  // Equity / PnL are rebuilt from `grid_profit_usdt + trend_pnl_usdt`
+  // (NOT `total_pnl_usdt`, which is stale — written at insert time and
+  // not refreshed by the engine on every tick).
   router.get('/portfolio-summary', asyncHandler(async (req, res) => {
     const userId = req.userId!;
     const bots = await dbAll<{
       id: number; pair: string; status: string; leverage: number;
-      investment_usdt: number; total_pnl_usdt: number;
+      investment_usdt: number;
       grid_profit_usdt: number; trend_pnl_usdt: number;
       position_size: number; avg_entry_price: number;
     }>(db, `
-      SELECT id, pair, status, leverage, investment_usdt, total_pnl_usdt,
+      SELECT id, pair, status, leverage, investment_usdt,
              grid_profit_usdt, trend_pnl_usdt, position_size, avg_entry_price
       FROM grid_bots
       WHERE COALESCE(user_id, 1) = ? AND status != 'stopped'
@@ -2180,7 +2183,8 @@ export function createV2Router(deps: V2RouterDeps): Router {
     const pairExposure: Record<string, number> = {};
 
     for (const b of bots) {
-      const equity = b.investment_usdt + b.total_pnl_usdt;
+      const botPnl = b.grid_profit_usdt + b.trend_pnl_usdt;
+      const equity = b.investment_usdt + botPnl;
       const positionUsdt = b.position_size * b.avg_entry_price;
       totalInvested += b.investment_usdt;
       totalEquity += equity;
@@ -2206,6 +2210,29 @@ export function createV2Router(deps: V2RouterDeps): Router {
       avgLeverage: round(avgLeverage, 1),
       pairExposure,
     });
+    return;
+  }));
+
+  // ── GET /api/v2/portfolio-equity-curve ──────────────────────────────
+  // H.7: aggregate equity across the user's bots, grouped by date.
+  // Sums daily_snapshots.equity per (date) for all non-stopped bots
+  // owned by the user. Bots without a snapshot for a given day don't
+  // contribute on that day — there is no carry-forward, so early days
+  // (when fewer bots existed) read as a smaller portfolio.
+  router.get('/portfolio-equity-curve', asyncHandler(async (req, res) => {
+    const userId = req.userId!;
+    const days = Math.min(parseInt(String(req.query.days ?? '90'), 10) || 90, 365);
+    const rows = await dbAll<{ date: string; equity: number }>(db, `
+      SELECT s.date, SUM(s.equity) AS equity
+      FROM daily_snapshots s
+      JOIN grid_bots b ON b.id = s.bot_id
+      WHERE COALESCE(b.user_id, 1) = ?
+        AND b.status != 'stopped'
+        AND s.date >= date('now', ?)
+      GROUP BY s.date
+      ORDER BY s.date ASC
+    `, [userId, `-${days} days`]);
+    res.json({ points: rows });
     return;
   }));
 

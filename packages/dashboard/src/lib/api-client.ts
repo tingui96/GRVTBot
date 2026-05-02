@@ -17,6 +17,8 @@ import {
   type GridState,
   type HealthV2,
   type OrderRow,
+  type PortfolioEquityPoint,
+  type PortfolioSummary,
   type RangeUpdatePlan,
   type RealizedSummary,
   type RebateSummary,
@@ -142,6 +144,15 @@ export const api = {
 
   getRebateSummary: (id: number) =>
     request<RebateSummary>(`/bots/${id}/rebate-summary`),
+
+  // H.7: portfolio-level aggregates across all user bots.
+  getPortfolioSummary: () =>
+    request<PortfolioSummary>('/portfolio-summary'),
+
+  getPortfolioEquityCurve: (days = 90) =>
+    request<{ points: PortfolioEquityPoint[] }>(
+      `/portfolio-equity-curve?days=${days}`
+    ),
 
   getRealizedSummary: (id: number) =>
     request<RealizedSummary>(`/bots/${id}/realized-summary`),

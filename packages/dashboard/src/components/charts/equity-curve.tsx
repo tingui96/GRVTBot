@@ -13,13 +13,31 @@ import {
 import { formatUsd } from '@/lib/format';
 import type { DailySnapshot } from '@/lib/api-types';
 
+export interface EquityPoint {
+  date: string;
+  equity: number;
+}
+
 interface EquityCurveProps {
-  snapshots: DailySnapshot[];
+  // Either pass per-bot snapshots (newest-first, mapped from /bots/:id/snapshots)
+  // OR pre-aggregated points (oldest-first, e.g. /portfolio-equity-curve).
+  snapshots?: DailySnapshot[];
+  points?: EquityPoint[];
   height?: number;
 }
 
-export function EquityCurve({ snapshots, height = 240 }: EquityCurveProps) {
-  if (snapshots.length === 0) {
+export function EquityCurve({ snapshots, points, height = 240 }: EquityCurveProps) {
+  // Normalize either input to chronological {date, equity}[].
+  // - snapshots: newest-first, equity field is `equity_usdt` (legacy alias).
+  // - points: already chronological; pass through.
+  const data: EquityPoint[] = points
+    ? points
+    : (snapshots ?? []).slice().reverse().map((s) => ({
+        date: s.date,
+        equity: s.equity_usdt,
+      }));
+
+  if (data.length === 0) {
     return (
       <div
         style={{ height }}
@@ -30,19 +48,13 @@ export function EquityCurve({ snapshots, height = 240 }: EquityCurveProps) {
     );
   }
 
-  // Snapshots come newest-first; reverse for chronological order.
-  const data = [...snapshots].reverse().map((s) => ({
-    date: s.date,
-    equity: s.equity_usdt,
-  }));
-
   const first = data[0]?.equity ?? 0;
   const last = data[data.length - 1]?.equity ?? 0;
   const isUp = last >= first;
   const stroke = isUp ? '#22C55E' : '#EF4444';
 
   const pctChange = first > 0 ? ((last - first) / first) * 100 : 0;
-  const ariaLabel = `Equity curve ${snapshots.length} daily snapshots ${
+  const ariaLabel = `Equity curve ${data.length} daily snapshots ${
     isUp ? 'up' : 'down'
   } ${pctChange.toFixed(1)}% from ${first.toFixed(2)} to ${last.toFixed(2)}`;
 

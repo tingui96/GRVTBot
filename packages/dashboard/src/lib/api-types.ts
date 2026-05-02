@@ -188,6 +188,30 @@ export interface RealizedSummary {
   lastFillAt: string | null;
 }
 
+// H.7: aggregate metrics across all of the user's non-stopped bots.
+// Returned by GET /api/v2/portfolio-summary.
+export interface PortfolioSummary {
+  botCount: number;
+  runningCount: number;
+  totalInvested: number;
+  totalEquity: number;
+  totalRealized: number;
+  totalUnrealized: number;
+  totalPnl: number;
+  totalPnlPct: number;
+  totalPositionUsdt: number;
+  avgLeverage: number;
+  // Per-pair notional exposure (sum of position_size * avg_entry_price).
+  pairExposure: Record<string, number>;
+}
+
+// H.7: per-day equity, summed across the user's non-stopped bots.
+// Returned by GET /api/v2/portfolio-equity-curve.
+export interface PortfolioEquityPoint {
+  date: string;   // YYYY-MM-DD
+  equity: number; // USD
+}
+
 export interface OrderRow {
   id: number;
   order_id: string;
