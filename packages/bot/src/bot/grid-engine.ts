@@ -967,6 +967,9 @@ export class GridEngine extends EventEmitter {
    */
   async pauseBot(botId: number): Promise<void> {
     try {
+      const bot = await db.getBot(botId);
+      if (!bot) throw new Error(`Bot ${botId} no encontrado`);
+
       const instance = this.bots.get(botId);
       if (instance) {
         // H.8: signal any in-flight placeInitialOrders loop to abort
@@ -980,8 +983,33 @@ export class GridEngine extends EventEmitter {
         this.bots.delete(botId);
       }
 
+      // SAFETY NET: even when the in-memory instance was missing (engine
+      // restart, race during boot, a previous pause that already removed
+      // it, or a partial cancelAllOrders that swallowed individual cancel
+      // failures), the bot may still have open orders on GRVT. Force a
+      // pair-scoped cancel through the owner's client so the GRVT side
+      // always ends up clean.
+      // Incident 2026-05-28: bot 49 was paused but ~63 orders survived
+      // and kept matching for ~4h, drifting the position to -0.12 BNB
+      // short. This catch-all prevents the bug from ever happening again.
+      try {
+        const client = await this.getClientForBot(bot);
+        const remaining = await client.getOpenOrders(bot.pair);
+        if (remaining.length > 0) {
+          log.warn(
+            `⚠ pause-bot ${botId}: ${remaining.length} ${bot.pair} orders survived in-memory cancel; force-cancel via GRVT`
+          );
+          await client.cancelAllOrders(bot.pair);
+        }
+      } catch (cancelErr) {
+        log.error(
+          { botId, err: (cancelErr as Error).message },
+          'pause-bot: belt-and-suspenders cancel failed (DB still marked paused)'
+        );
+      }
+
       await db.updateBot(botId, { status: 'paused' });
-      
+
       log.info(`⏸️ Bot ${botId} pausado`);
       this.emit('botPaused', { botId });
 
@@ -1016,38 +1044,76 @@ export class GridEngine extends EventEmitter {
 
       log.info(`📍 Posición real: ${realPositionSize} (DB: ${bot.position_size})`);
 
-      // Si hay posición abierta, cerrarla con orden agresiva
+      // Close any open position. Retry with escalating slippage so we
+      // do not leave a half-closed position when the first limit doesn't
+      // match (this was the second half of the 2026-05-28 bot 49 bug:
+      // a 0.5% aggressive limit that didn't fill, then no retry).
+      let finalPositionSize = realPositionSize;
       if (realPositionSize !== 0) {
         const closeSide = realPositionSize > 0 ? 'sell' : 'buy';
-        const closeSize = Math.abs(realPositionSize);
+        const SLIPPAGE_STEPS = [0.005, 0.02, 0.05]; // 0.5%, 2%, 5%
 
-        log.info(`🔄 Cerrando posición: ${closeSide} ${closeSize} ${bot.pair}`);
+        for (let attempt = 0; attempt < SLIPPAGE_STEPS.length; attempt++) {
+          const pos = (await client.getPositions()).find(p => p.instrument === bot.pair);
+          const remaining = pos ? parseFloat(pos.size) : 0;
+          finalPositionSize = remaining;
+          if (remaining === 0) break;
 
-        // Precio agresivo (0.5% peor que market) con GTC para garantizar fill
-        const ticker = await client.getTicker(bot.pair);
-        const currentPrice = parseFloat(ticker.last_price);
-        const aggressivePrice = closeSide === 'sell'
-          ? Math.floor(currentPrice * 0.995 * 100) / 100   // 0.5% abajo para sell
-          : Math.floor(currentPrice * 1.005 * 100) / 100;  // 0.5% arriba para buy
+          const closeSize = Math.abs(remaining);
+          const ticker = await client.getTicker(bot.pair);
+          const currentPrice = parseFloat(ticker.last_price);
+          const slip = SLIPPAGE_STEPS[attempt]!;
+          const aggressivePrice = closeSide === 'sell'
+            ? Math.floor(currentPrice * (1 - slip) * 100) / 100
+            : Math.floor(currentPrice * (1 + slip) * 100) / 100;
 
-        // ⚠️ CRÍTICO: time_in_force debe matchear la firma EIP-712 (GTC = 1).
-        // sub_account_id must match the client's own sub-account so
-        // multi-tenant orders land on the right wallet.
-        await client.createOrder({
-          sub_account_id: client.subAccountId,
-          instrument: bot.pair,
-          size: (Math.floor(closeSize * 100) / 100).toString(),
-          price: aggressivePrice.toString(),
-          side: closeSide,
-          type: 'limit',
-          time_in_force: 'gtc'  // GTC matchea timeInForce=1 en EIP-712
-        }, true);
+          log.info(
+            `🔄 Close attempt ${attempt + 1}/${SLIPPAGE_STEPS.length}: ${closeSide} ${closeSize} ${bot.pair} @ $${aggressivePrice} (slip ${(slip * 100).toFixed(1)}%)`
+          );
 
-        log.info(`✅ Orden de cierre: ${closeSide} ${closeSize} @ $${aggressivePrice} (GTC)`);
+          try {
+            // GTC limit at aggressive price — matches existing book size
+            // immediately when slippage is wide enough.
+            await client.createOrder({
+              sub_account_id: client.subAccountId,
+              instrument: bot.pair,
+              size: (Math.floor(closeSize * 100) / 100).toString(),
+              price: aggressivePrice.toString(),
+              side: closeSide,
+              type: 'limit',
+              time_in_force: 'gtc'
+            }, true);
+          } catch (orderErr) {
+            log.error({ botId, attempt, err: (orderErr as Error).message }, 'close-order placement failed');
+          }
+
+          // Wait for fill, then check
+          await new Promise((r) => setTimeout(r, 3_000));
+        }
+
+        // Final cancel sweep — in case any close attempt left a resting
+        // order (slippage too aggressive, partial fill, etc.) we don't
+        // want it as a new orphan.
+        try {
+          await client.cancelAllOrders(bot.pair);
+        } catch {
+          // best-effort
+        }
+
+        const posAfter = (await client.getPositions()).find(p => p.instrument === bot.pair);
+        finalPositionSize = posAfter ? parseFloat(posAfter.size) : 0;
+        if (finalPositionSize !== 0) {
+          log.error(
+            { botId, pair: bot.pair, residualSize: finalPositionSize },
+            '⚠ close-bot: position did NOT fully close after retries — manual cleanup required'
+          );
+        } else {
+          log.info(`✅ Posición cerrada en ${bot.pair}`);
+        }
       }
 
       // Actualizar status a stopped
-      await db.updateBot(botId, { status: 'stopped', position_size: realPositionSize });
+      await db.updateBot(botId, { status: 'stopped', position_size: finalPositionSize });
 
       log.info(`🛑 Bot ${botId} cerrado completamente`);
       this.emit('botClosed', { botId });
