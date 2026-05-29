@@ -1096,24 +1096,39 @@ export class GridEngine extends EventEmitter {
         // want it as a new orphan.
         try {
           await client.cancelAllOrders(bot.pair);
-        } catch {
-          // best-effort
-        }
-
-        const posAfter = (await client.getPositions()).find(p => p.instrument === bot.pair);
-        finalPositionSize = posAfter ? parseFloat(posAfter.size) : 0;
-        if (finalPositionSize !== 0) {
-          log.error(
-            { botId, pair: bot.pair, residualSize: finalPositionSize },
-            '⚠ close-bot: position did NOT fully close after retries — manual cleanup required'
-          );
-        } else {
-          log.info(`✅ Posición cerrada en ${bot.pair}`);
+        } catch (sweepErr) {
+          log.error({ botId, err: (sweepErr as Error).message }, 'close-bot: final cancel sweep threw');
         }
       }
 
-      // Actualizar status a stopped
-      await db.updateBot(botId, { status: 'stopped', position_size: finalPositionSize });
+      // VERIFY before declaring the bot stopped. cancelAllOrders() can
+      // silently return 0 on a transient API error and getPositions() can
+      // fail, so re-read BOTH from GRVT as the source of truth. Only mark
+      // 'stopped' when the GRVT side is provably clean (no open orders AND
+      // flat); otherwise leave the bot 'paused' (still tracked) and throw,
+      // instead of recording a false 'stopped' over a live position/orders.
+      const [residualOrders, positions2] = await Promise.all([
+        client.getOpenOrders(bot.pair),
+        client.getPositions(),
+      ]);
+      const residualPos = positions2.find(p => p.instrument === bot.pair);
+      finalPositionSize = residualPos ? parseFloat(residualPos.size) : 0;
+
+      if (residualOrders.length > 0 || finalPositionSize !== 0) {
+        log.error(
+          { botId, pair: bot.pair, residualOrders: residualOrders.length, residualSize: finalPositionSize },
+          '⚠ close-bot: GRVT side NOT clean after retries — leaving bot PAUSED, manual cleanup required'
+        );
+        await db.updateBot(botId, { status: 'paused', position_size: finalPositionSize });
+        throw new Error(
+          `closeBot ${botId}: GRVT not clean (orders=${residualOrders.length}, position=${finalPositionSize}); left paused`
+        );
+      }
+
+      log.info(`✅ Posición cerrada en ${bot.pair}`);
+
+      // GRVT confirmed clean — safe to mark stopped.
+      await db.updateBot(botId, { status: 'stopped', position_size: 0 });
 
       log.info(`🛑 Bot ${botId} cerrado completamente`);
       this.emit('botClosed', { botId });
