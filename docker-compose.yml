@@ -35,14 +35,17 @@ services:
     environment:
       NODE_ENV: production
       DASHBOARD_PORT: "3848"
+      MASTER_KEY_PATH: /run/secrets/master.key
       LOG_LEVEL: "${LOG_LEVEL:-info}"
     volumes:
       - ./data:/app/data
       - ./logs/bot:/app/logs
+      # AES-256-GCM master key — host-generated, 0600, owned by uid 10000.
+      - ./secrets/master.key:/run/secrets/master.key:ro
     ports:
-      # Direct port for `--profile no-tls` deployments. With caddy, you can
-      # remove this binding so only caddy is reachable from the internet.
-      - "${BOT_PORT:-3848}:3848"
+      # Loopback-only: reachable via SSH tunnel, never from the public
+      # internet (no domain/TLS in this single-user deployment).
+      - "127.0.0.1:${BOT_PORT:-3848}:3848"
     healthcheck:
       test: ["CMD", "curl", "-fs", "http://127.0.0.1:3848/api/health"]
       interval: 30s

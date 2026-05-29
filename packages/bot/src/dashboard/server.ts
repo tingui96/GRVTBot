@@ -178,11 +178,13 @@ app.use(
 );
 app.use(express.json());
 
-// Debug logging middleware
-app.use((req, res, next) => {
-  console.log(`🔧 [DEBUG] ${req.method} ${req.path}`);
-  next();
-});
+// Debug logging middleware (gated — set LOG_LEVEL=debug for per-request logs)
+if (process.env.LOG_LEVEL === 'debug') {
+  app.use((req, res, next) => {
+    console.log(`🔧 [DEBUG] ${req.method} ${req.path}`);
+    next();
+  });
+}
 
 // Health endpoint BEFORE auth (for external monitoring)
 app.get('/api/health', async (req, res) => {
@@ -1402,7 +1404,7 @@ async function startServer() {
     httpServer.listen(PORT, () => {
       console.log('🔧 Edison: GRVT Grid Bot Dashboard - Fase 3');
       console.log(`🌐 Server: http://localhost:${PORT}`);
-      console.log(`🔐 Auth: ${process.env.DASHBOARD_USER} / ${process.env.DASHBOARD_PASS}`);
+      console.log(`🔐 Legacy basic-auth user: ${process.env.DASHBOARD_USER || '(unset)'}`);
       console.log(`💾 Database: SQLite WAL mode`);
       console.log(`🤖 Grid Engine: Listo (no iniciado automáticamente)`);
       console.log('🚀 Dashboard completo - ¡LISTO PARA TRADING!');
