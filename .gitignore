@@ -60,4 +60,8 @@ secrets/
 **/tests/**/*.js.map
 **/tests/**/*.d.ts
 **/tests/**/*.d.ts.map
+
+# ...but DO track the hand-authored Vite ambient types — it's a source file
+# (declares import.meta.env and *.css modules), not a build artifact.
+!**/vite-env.d.ts
 **/*.tsbuildinfo
