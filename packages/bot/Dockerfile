@@ -25,7 +25,11 @@ COPY package.json package-lock.json ./
 COPY packages/bot/package.json packages/bot/
 COPY packages/bot/tsconfig.json packages/bot/
 
-RUN npm ci --workspace=@grvt-grid/bot --include-workspace-root
+# Force native modules (sqlite3) to compile from source against THIS image's
+# glibc. Otherwise npm fetches a prebuilt sqlite3 binary linked to a newer
+# glibc (needs GLIBC_2.38) that fails to load on the bookworm runtime (2.36)
+# with ERR_DLOPEN_FAILED.
+RUN npm_config_build_from_source=true npm ci --workspace=@grvt-grid/bot --include-workspace-root
 
 # Now copy the source and build
 COPY packages/bot/src packages/bot/src
