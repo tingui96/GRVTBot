@@ -2411,6 +2411,70 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     return;
   }));
 
+  // ── POST /api/v2/backtest/optimize ──────────────────────────────────
+  // H.6b: sweep range × num_grids × leverage × direction over the same
+  // historical candles and return the combos ranked by net profit. Pure
+  // computation — fetches candles once, then runs many in-memory sims.
+  interface OptimizeBody {
+    pair?: string;
+    investment_usdt?: number;
+    fee_pct?: number;
+    interval?: string;
+    limit?: number;
+    max_drawdown_pct?: number;
+  }
+
+  router.post('/backtest/optimize', asyncHandler(async (req, res) => {
+    const body = (req.body ?? {}) as OptimizeBody;
+    const { pair, investment_usdt, fee_pct, interval, limit: candleLimit, max_drawdown_pct } = body;
+
+    const errors: string[] = [];
+    if (!pair) errors.push('pair is required');
+    if (!Number.isFinite(investment_usdt) || (investment_usdt ?? 0) <= 0) errors.push('investment > 0');
+    if (fee_pct != null && (!Number.isFinite(fee_pct) || fee_pct < 0 || fee_pct > 1)) {
+      errors.push('fee_pct in [0, 1]');
+    }
+    if (errors.length) return res.status(400).json({ error: 'validation_failed', errors });
+
+    try {
+      const klines = (await grvtClient.getKlines(
+        pair!,
+        interval ?? 'CI_1_H',
+        Math.min(candleLimit ?? 500, 1000)
+      )) as Array<{
+        openTime: number;
+        open: number;
+        high: number;
+        low: number;
+        close: number;
+      }>;
+
+      const candles = klines.map((k) => ({
+        time: k.openTime / 1000,
+        open: k.open,
+        high: k.high,
+        low: k.low,
+        close: k.close,
+      })).reverse();
+
+      const { optimizeBacktest } = await import('../bot/backtest-optimizer.js');
+      const result = optimizeBacktest(
+        {
+          pair: pair!,
+          investmentUSDT: investment_usdt!,
+          feePct: fee_pct,
+          maxDrawdownPct: max_drawdown_pct,
+        },
+        candles
+      );
+
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: 'optimize_failed', message: (err as Error).message });
+    }
+    return;
+  }));
+
   // ── GET /api/v2/portfolio-summary ───────────────────────────────────
   // H.7: aggregate risk metrics across all user bots.
   // Equity / PnL are rebuilt from `grid_profit_usdt + trend_pnl_usdt`
