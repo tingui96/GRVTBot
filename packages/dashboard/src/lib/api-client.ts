@@ -18,6 +18,8 @@ import {
   type HealthV2,
   type BacktestInput,
   type BacktestResult,
+  type OptimizeInput,
+  type OptimizeResult,
   type OrderRow,
   type PortfolioEquityPoint,
   type PortfolioSummary,
@@ -154,6 +156,13 @@ export const api = {
   // equityCurve is already thinned server-side to ~200 points.
   runBacktest: (input: BacktestInput) =>
     request<BacktestResult>('/backtest', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  // H.6b: sweep many parameter combos and rank them by net profit.
+  optimizeBacktest: (input: OptimizeInput) =>
+    request<OptimizeResult>('/backtest/optimize', {
       method: 'POST',
       body: JSON.stringify(input),
     }),

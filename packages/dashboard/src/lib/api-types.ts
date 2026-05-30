@@ -240,6 +240,48 @@ export interface BacktestResult {
   candlesProcessed: number;
 }
 
+// H.6b: parameter sweep. POST /api/v2/backtest/optimize tries many
+// range/grid/leverage/direction combos on the same candles and ranks them
+// by net profit, so the user gets suggested parameters instead of guessing.
+export interface OptimizeInput {
+  pair: string;
+  investment_usdt: number;
+  fee_pct?: number;
+  interval?: CandleInterval;
+  limit?: number;
+  max_drawdown_pct?: number; // drawdown cap for the "recommended" flag, default 30
+}
+
+export interface OptimizeCandidate {
+  direction: 'long' | 'short';
+  leverage: number;
+  lowerPrice: number;
+  upperPrice: number;
+  numGrids: number;
+  rangeLabel: string;
+  netProfit: number;
+  returnPct: number;
+  maxDrawdownPct: number;
+  roundTrips: number;
+  avgProfitPerTrip: number;
+  recommended: boolean;
+}
+
+export interface OptimizeResult {
+  candidates: OptimizeCandidate[];
+  priceStats: {
+    min: number;
+    max: number;
+    first: number;
+    last: number;
+    mean: number;
+    std: number;
+    trendPct: number;
+  };
+  combinationsTested: number;
+  candlesProcessed: number;
+}
+
 export interface OrderRow {
   id: number;
   order_id: string;

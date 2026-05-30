@@ -8,7 +8,7 @@
 import { useState } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
-import { Play, ArrowRight, AlertTriangle } from 'lucide-react';
+import { Play, ArrowRight, AlertTriangle, Wand2 } from 'lucide-react';
 import { api } from '@/lib/api-client';
 import { Card } from '@/components/primitives/card';
 import { Button } from '@/components/primitives/button';
@@ -21,6 +21,9 @@ import type {
   BacktestInput,
   BacktestResult,
   CandleInterval,
+  OptimizeInput,
+  OptimizeResult,
+  OptimizeCandidate,
 } from '@/lib/api-types';
 
 interface FormState {
@@ -85,6 +88,10 @@ export function BacktestPage() {
     mutationFn: (input: BacktestInput) => api.runBacktest(input),
   });
 
+  const optimizeMutation = useMutation({
+    mutationFn: (input: OptimizeInput) => api.optimizeBacktest(input),
+  });
+
   const lower = parseFloat(form.lower);
   const upper = parseFloat(form.upper);
   const grids = parseInt(form.grids, 10);
@@ -104,8 +111,53 @@ export function BacktestPage() {
   if (!Number.isFinite(feePct) || feePct < 0 || feePct > 1) errors.push(t('backtest.validation.feeRange'));
   const isValid = errors.length === 0;
 
+  // Optimize only needs pair + investment + fee — it discovers the range,
+  // grids, leverage and direction itself, so the range/grid fields can be
+  // blank when kicking it off.
+  const canOptimize =
+    !!form.pair &&
+    Number.isFinite(investment) && investment > 0 &&
+    Number.isFinite(feePct) && feePct >= 0 && feePct <= 1;
+
   function update<K extends keyof FormState>(key: K, value: FormState[K]) {
     setForm((s) => ({ ...s, [key]: value }));
+  }
+
+  function optimize() {
+    if (!canOptimize) return;
+    optimizeMutation.mutate({
+      pair: form.pair,
+      investment_usdt: investment,
+      fee_pct: feePct,
+      interval: form.interval,
+      limit,
+    });
+  }
+
+  // Fill the form with a suggested combo, then run the single backtest so
+  // the equity curve + full metrics show for that pick.
+  function applyCandidate(c: OptimizeCandidate) {
+    const next: FormState = {
+      ...form,
+      direction: c.direction,
+      leverage: String(c.leverage),
+      lower: String(c.lowerPrice),
+      upper: String(c.upperPrice),
+      grids: String(c.numGrids),
+    };
+    setForm(next);
+    mutation.mutate({
+      pair: next.pair,
+      direction: c.direction,
+      leverage: c.leverage,
+      lower_price: c.lowerPrice,
+      upper_price: c.upperPrice,
+      num_grids: c.numGrids,
+      investment_usdt: investment,
+      fee_pct: feePct,
+      interval: next.interval,
+      limit,
+    });
   }
 
   function run() {
@@ -273,9 +325,31 @@ export function BacktestPage() {
             <Play className="size-4" />
             {mutation.isPending ? t('backtest.running') : t('backtest.runBtn')}
           </Button>
+
+          <Button
+            variant="secondary"
+            onClick={optimize}
+            disabled={!canOptimize || optimizeMutation.isPending}
+          >
+            <Wand2 className="size-4" />
+            {optimizeMutation.isPending ? t('backtest.optimizing') : t('backtest.optimizeBtn')}
+          </Button>
+          <p className="text-2xs text-text-muted -mt-1">{t('backtest.optimizeHint')}</p>
         </Card>
 
         <div className="lg:col-span-3 flex flex-col gap-4">
+          {optimizeMutation.isError && (
+            <Card className="border-danger/40">
+              <p className="text-sm text-danger">
+                {t('backtest.failedPrefix')} {(optimizeMutation.error as Error).message}
+              </p>
+            </Card>
+          )}
+
+          {optimizeMutation.data && (
+            <OptimizePanel result={optimizeMutation.data} onUse={applyCandidate} />
+          )}
+
           {mutation.isError && (
             <Card className="border-danger/40">
               <p className="text-sm text-danger">
@@ -393,5 +467,108 @@ function ResultPanel({
         </Button>
       </div>
     </>
+  );
+}
+
+function OptimizePanel({
+  result,
+  onUse,
+}: {
+  result: OptimizeResult;
+  onUse: (c: OptimizeCandidate) => void;
+}) {
+  const t = useT();
+  const trend = result.priceStats.trendPct;
+  const trending = Math.abs(trend) > 8;
+
+  if (result.candidates.length === 0) {
+    return (
+      <Card>
+        <p className="text-sm text-text-muted">{t('backtest.optimizeNoResults')}</p>
+      </Card>
+    );
+  }
+
+  return (
+    <Card className="flex flex-col gap-3">
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold text-text-secondary uppercase tracking-wider">
+          {t('backtest.optimizeTitle')}
+        </h2>
+        <span className="text-2xs text-text-muted">
+          {t('backtest.optimizeTested', {
+            n: result.combinationsTested,
+            candles: result.candlesProcessed,
+          })}
+        </span>
+      </div>
+
+      {trending && (
+        <div className="flex items-start gap-2 rounded-md border border-warning/40 p-2">
+          <AlertTriangle className="size-4 text-warning shrink-0 mt-0.5" />
+          <p className="text-xs text-text-secondary">
+            {t('backtest.optimizeTrendWarn', { pct: trend.toFixed(1) })}
+          </p>
+        </div>
+      )}
+
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-text-muted text-left">
+              <th className="font-medium py-1.5 pr-2">{t('backtest.colNet')}</th>
+              <th className="font-medium py-1.5 pr-2">{t('backtest.colReturn')}</th>
+              <th className="font-medium py-1.5 pr-2">{t('backtest.colDD')}</th>
+              <th className="font-medium py-1.5 pr-2">{t('backtest.colTrips')}</th>
+              <th className="font-medium py-1.5 pr-2">{t('backtest.colRange')}</th>
+              <th className="font-medium py-1.5 pr-2">{t('backtest.colGrids')}</th>
+              <th className="font-medium py-1.5 pr-2">{t('backtest.colLev')}</th>
+              <th className="font-medium py-1.5 pr-2">{t('backtest.colDir')}</th>
+              <th className="py-1.5" />
+            </tr>
+          </thead>
+          <tbody>
+            {result.candidates.map((c, i) => (
+              <tr
+                key={i}
+                className={`border-t border-border-subtle ${c.recommended ? 'bg-success/5' : ''}`}
+              >
+                <td className="py-1.5 pr-2">
+                  <span className={c.netProfit >= 0 ? 'text-success' : 'text-danger'}>
+                    {formatPnl(c.netProfit)}
+                  </span>
+                  {c.recommended && (
+                    <span className="ml-1.5 text-2xs text-success">
+                      ★ {t('backtest.optimizeRecommended')}
+                    </span>
+                  )}
+                </td>
+                <td className="py-1.5 pr-2">{formatPercent(c.returnPct)}</td>
+                <td className="py-1.5 pr-2">
+                  <span className={c.maxDrawdownPct > 30 ? 'text-danger' : 'text-text-primary'}>
+                    {formatPercent(-c.maxDrawdownPct)}
+                  </span>
+                </td>
+                <td className="py-1.5 pr-2">{c.roundTrips}</td>
+                <td className="py-1.5 pr-2 whitespace-nowrap">
+                  {c.lowerPrice.toFixed(0)}–{c.upperPrice.toFixed(0)}
+                </td>
+                <td className="py-1.5 pr-2">{c.numGrids}</td>
+                <td className="py-1.5 pr-2">{c.leverage}x</td>
+                <td className="py-1.5 pr-2">{c.direction === 'long' ? 'L' : 'S'}</td>
+                <td className="py-1.5">
+                  <button
+                    onClick={() => onUse(c)}
+                    className="text-primary hover:underline font-medium"
+                  >
+                    {t('backtest.useBtn')}
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Card>
   );
 }
